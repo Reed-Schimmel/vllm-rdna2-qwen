@@ -10,6 +10,7 @@ import threading
 import torch
 
 from vllm.logger import init_logger
+from vllm.v1.simple_kv_offload import timing as _timing
 from vllm.platforms import current_platform
 from vllm.v1.simple_kv_offload.cuda_mem_ops import (
     CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
@@ -124,7 +125,11 @@ class DmaCopyBackend:
             stream = store_stream if is_store else load_stream
             if wait_event is not None:
                 stream.wait_event(wait_event)
+            if _timing.ENABLED:
+                _t0 = _timing.copy_begin()
             copy_blocks(src_blocks, dst_blocks, params)
+            if _timing.ENABLED:
+                _timing.copy_end(_t0, len(src_blocks) * params.num_layers, is_store)
             event = torch.Event()
             event.record(stream)
             events_list.append((event_idx, event))

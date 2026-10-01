@@ -406,12 +406,25 @@ class _PleQuantTable:
             key = "weight_fp8"
         else:
             key = "weight_i4"
+        # PLE_OFFLOAD_ANON=1 (gfx1030 fork, 2026-10-01): copy every shard into this process's anonymous
+        # memory instead of serving it from the safetensors mmap. Page-cache pages are the kernel's first
+        # reclaim target: under memory pressure (e.g. 64 GiB pinned by --kv-offloading-size) part of the
+        # table was evicted (52.5 -> 24 GB resident in a 40 GB pressure test), every lookup then took major
+        # faults, worker steps grew to 3-25 s unevenly across TP ranks, and the one-shot all-reduce's 2 s
+        # watchdog stopped the engine. Anonymous memory cannot be reclaimed without swap, and the file's
+        # page-cache copy is dropped after the copy, so RAM use is unchanged (one copy). Costs a sequential
+        # read of the sidecar at worker start (seconds when cached, ~2 min cold from SATA).
+        self.anonymous = os.getenv("PLE_OFFLOAD_ANON", "0") == "1"
+        t_anon = time.perf_counter()
         self._q, self._s, self._s2 = [], [], []
         for n in range(n_shards):
             f = safe_open(os.path.join(quant_dir, f"shard_{n}.safetensors"),
                           framework="pt")
-            self._q.append(f.get_tensor(key))
-            self._s.append(f.get_tensor("weight_scale"))
+            q_t, s_t = f.get_tensor(key), f.get_tensor("weight_scale")
+            if self.anonymous:
+                q_t, s_t = q_t.clone(), s_t.clone()
+            self._q.append(q_t)
+            self._s.append(s_t)
             self._s2.append(
                 f.get_tensor("weight_scale_2").item()
                 if "weight_scale_2" in f.keys() else 1.0
@@ -431,8 +444,20 @@ class _PleQuantTable:
         self._lut_np = None
         if self.is_fp8:
             self._lut_np = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).float().numpy()
-        logger.info("PLE quant table: %s, %d shards mmapped from %s",
-                    self.layout, n_shards, quant_dir)
+        if self.anonymous:
+            for n in range(n_shards):  # drop the file's page-cache copy: the table now lives in anon memory
+                with contextlib.suppress(OSError):
+                    fd = os.open(os.path.join(quant_dir, f"shard_{n}.safetensors"), os.O_RDONLY)
+                    try:
+                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                    finally:
+                        os.close(fd)
+            logger.info("PLE quant table: %s, %d shards copied into anonymous memory (%.1f GB, %.0f s; "
+                        "not reclaimable by the page cache) from %s", self.layout, n_shards,
+                        sum(t.nbytes for t in self._q + self._s) / 1e9, time.perf_counter() - t_anon, quant_dir)
+        else:
+            logger.info("PLE quant table: %s, %d shards mmapped from %s",
+                        self.layout, n_shards, quant_dir)
 
     def populate_page_tables(self) -> bool:
         """madvise(MADV_POPULATE_READ) every shard mapping: faults the whole table into the

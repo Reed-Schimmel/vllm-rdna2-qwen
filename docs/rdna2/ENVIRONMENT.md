@@ -169,6 +169,7 @@ Any `VLLM_RDNA_QSA_*` override is logged as a warning at startup.
 |---|---|---|
 | `--kv-offloading-size N` (vLLM argument, e.g. via `EXTRA_ARGS`) | off | Keep N GiB (total across all TP ranks) of pinned CPU RAM as a second KV-cache tier. Prefixes evicted from the GPU reload from RAM instead of being recomputed. |
 | `VLLM_USE_SIMPLE_KV_OFFLOAD` | `0` | **Set to `1` with this model.** Selects `SimpleCPUOffloadConnector`, which reuses vLLM's prefix-cache logic for every cache group. The default `OffloadingConnector` refuses to start on the QSA compressor ring (`tokens_per_block=4 not divisible by tokens_per_hash=784`). |
+| `VLLM_RDNA_OFFLOAD_TIMING` | `0` | Diagnostic: log each offload copy's duration, and every worker step slower than `VLLM_RDNA_OFFLOAD_TIMING_SLOW_MS` (default 500), with whether a copy overlapped it. |
 
 ---
 
@@ -185,6 +186,7 @@ CPU worker process serves lookups from host memory, and the GPUs wait for its re
 | `VLLM_PLE_OFFLOAD_READY_TIMEOUT` | `600` (serve script: `3600`) | Seconds to wait for the worker to load the table and for all ranks to register. |
 | `PLE_OFFLOAD_DOORBELL` | `1` | Rank 0 posts each step's request into a shared memory page that the worker polls, instead of sending a ZMQ message. Saves ~170 µs per step. `0` restores ZMQ. |
 | `PLE_OFFLOAD_PREFAULT` | `1` | At startup, touch the table's pages in the background so the first requests don't stall on page faults. |
+| `PLE_OFFLOAD_ANON` | `0` | `1`: copy the quantized table into the worker's own (anonymous) memory at start and drop the file's page-cache copy. The kernel can then no longer evict table pages under memory pressure, which otherwise causes multi-second lookups and uneven TP ranks. **Required alongside `--kv-offloading-size`** (§19). Adds ~1–2 min to boot. Needs enough RAM for the whole table. |
 | `PLE_OFFLOAD_DEBUG_HOPS` | `0` | Test hook: timestamp each hop of the per-step round trip and log per-hop averages. |
 | `PLE_OFFLOAD_DEBUG_TRACE` | unset | Test hook: append one line per request (sequence, sizes, input and result hashes) to this file, so two runs can be compared. |
 | `PLE_OFFLOAD_DEBUG_DELAY_MS` | `0` | Test hook: add an artificial delay to every worker request. |

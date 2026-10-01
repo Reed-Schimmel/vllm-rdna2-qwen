@@ -81,6 +81,7 @@ variable is explained in [`docs/rdna2/ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md
 | `PLE_INT4` | fp8 n-gram table sidecar | The n-gram table served from host memory by the CPU offload worker. |
 | `EXTRA_ARGS` | `--prefix-cache-retention-interval 6272 --max-num-seqs 2 --kv-offloading-size 64` | Retain linear-attention state every 8 blocks along long prompts, for faster follow-up turns; at most 2 requests run at once (the rest queue); 64 GiB of CPU RAM as a second KV-cache tier (~1.32M tokens), so conversations evicted from the GPU reload in seconds instead of being recomputed. |
 | `VLLM_USE_SIMPLE_KV_OFFLOAD` | `1` | Required with this model for the CPU tier (see [`docs/rdna2/CHANGES.md`](docs/rdna2/CHANGES.md) §19). |
+| `PLE_OFFLOAD_ANON` | `1` | The n-gram worker keeps the 52.5 GB table in its own memory, not the page cache, so memory pressure can't evict it. Required with the CPU tier: without it, evicted table pages made lookups take seconds and desynchronised the cards. |
 | `VLLM_RDNA_AR` | `1` | Custom one-shot all-reduce for decode-sized messages. |
 | `VLLM_RDNA_AR_MODE` | `wide` | 16-byte writes forming whole 128-byte lines, writes only, local waiting. The serve script's default. |
 | `VLLM_RDNA_AR_BLOCKS`, `VLLM_RDNA_AR_PACE` | `4`, `16` | Fewer concurrent write streams, with spacing between bursts. |
@@ -90,6 +91,10 @@ variable is explained in [`docs/rdna2/ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md
 | `NCCL_PROTO` | `Simple` | RCCL moves data in large chunks rather than flagged 8-byte stores. The serve script's default. |
 | `NCCL_P2P_LEVEL`, `NCCL_GRAPH_MIXING_SUPPORT` | `SYS`, `1` | Set by the serve script: direct card-to-card RCCL, and correct graph and eager mixing. |
 | TunableOp | lookup-only | Tuned GEMM rows for the installed rocBLAS build; never tuned while serving. |
+
+**Host memory budget.** With the CPU tier, RAM is committed explicitly: 64 GiB pinned for the tier, 52.5 GB for the
+n-gram table, ~6 GB per GPU worker, plus whatever else the host runs. About 15 GB of the 188 GB stays available. Size
+`--kv-offloading-size` so `MemAvailable` keeps a margin for the rest of the system.
 
 Single-stream decode is about 59.5 tokens/s at the production operating point. The published container,
 with its defaults, reaches about 64 tokens/s on the same cards. The gap is a deliberate quality choice:

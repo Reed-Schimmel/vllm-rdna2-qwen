@@ -1627,3 +1627,10 @@ def init_worker_distributed_environment(
     # Init ec connector here before KV caches init
     # NOTE: We do not init KV caches for Encoder-only instance in EPD disagg mode
     ensure_ec_transfer_initialized(vllm_config)
+
+
+# gfx1030 fork diagnostic (VLLM_RDNA_OFFLOAD_TIMING=1): log slow worker steps and offload copy overlap.
+from vllm.v1.simple_kv_offload import timing as _offload_timing  # noqa: E402
+
+if _offload_timing.ENABLED:
+    Worker.execute_model = _offload_timing.wrap_execute_model(Worker.execute_model)

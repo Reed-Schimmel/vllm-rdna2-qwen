@@ -855,3 +855,26 @@ is: with 64 GiB pinned on a 188 GB host the 52.5 GB fp8 table stayed 100 % resid
   GPU). Corrupted KV would show up as garbage or a confidence collapse from the first token; none was seen.
 - Load: a 240 s, 4-worker mixed soak (503k prompt tokens) with offload active: 0 errors, no kernel events.
 - Decode unchanged: 63.0 t/s single stream (MTP 0, 262k context, fp8 n-gram table).
+
+**Incident and fix (same day): keep the n-gram table out of the page cache, `PLE_OFFLOAD_ANON=1`.** After four hours
+of production with the 64 GiB tier, a long agent turn hung: decode stopped, ranks 1–3 logged `PLE lookup … has taken
+>5 s`, and the one-shot all-reduce watchdog fired on ranks 0 and 2 (each waiting for the other, collectives apart).
+
+- The offload's copies were not involved: diagnostic timing (`VLLM_RDNA_OFFLOAD_TIMING=1`, logs every worker step over
+  `VLLM_RDNA_OFFLOAD_TIMING_SLOW_MS`) showed copies of 1–5 blocks taking milliseconds, and no slow step overlapped one. A
+  178k-token context with two reload cycles reproduced nothing (worst gap between tokens 0.05 s).
+- Cause: the fp8 n-gram table (52.5 GB) lives in the page cache, the kernel's first reclaim target. The tier pins 64 GiB
+  that cannot be reclaimed, so ordinary memory demand evicts table pages instead of free memory. A 40 GB pressure test
+  cut residency from 52.5 to 24 GB (worker major faults 95 → 370,902 in 150 s). Steps took 3–25 s, unevenly across TP
+  ranks (e.g. 4.3 / 4.5 / 5.0 s), past the watchdog's 2 s, and residency did not recover after the pressure ended.
+- Fix: `PLE_OFFLOAD_ANON=1` makes the worker copy every shard into its own anonymous memory at start and drop the
+  file's page-cache copy (same RAM, one copy). Without swap headroom anonymous memory cannot be reclaimed, so pressure
+  falls on everything else. Costs a sequential read of the table at worker start (~100–135 s cold from SATA). Opt-in:
+  a host with less RAM than the table should keep the mmap.
+- Validated with the 2 s watchdog, 64 GiB tier and `PLE_OFFLOAD_ANON=1`: 10 GB pressure during decode → 0 new worker
+  page faults, worst gap 0.02 s; 178k-token reload cycles (TTFT 1.1 s, decode 59.5 t/s, worst gap 0.09 s); exactness
+  vs GPU prefix hits passes (pooled noise floor: GPU-only runs diverge as early as token 9; one reload token-identical
+  over 64 tokens); 240 s four-worker soak clean; no wedges, no PLE stalls, no kernel events.
+- **Memory budget is now explicit:** pinned tier + table + workers. On the 188 GB host with 64 GiB pinned, ~15 GB stays
+  available. Size the tier so `MemAvailable` keeps a margin; anything that then runs the host out of memory hits the
+  OOM killer, where the largest process is the n-gram worker.
