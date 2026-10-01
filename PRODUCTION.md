@@ -78,8 +78,8 @@ variable is explained in [`docs/rdna2/ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md
 | `GPUUTIL` | `0.93` | VRAM fraction for vLLM; KV cache takes the rest (~510–525k tokens). |
 | `DENSE_INT8`, `DENSE_INT8_ONLY` | `1`, `1` | int8 copies of the dense projections for decode, and the fp16 copies freed (more KV cache). |
 | `VISION` | `1` | Image input enabled. |
-| `PLE_INT4` | fp8 n-gram table sidecar | The n-gram table served from host memory by the CPU offload worker. |
-| `EXTRA_ARGS` | `--prefix-cache-retention-interval 6272 --max-num-seqs 2 --kv-offloading-size 64` | Retain linear-attention state every 8 blocks along long prompts, for faster follow-up turns; at most 2 requests run at once (the rest queue); 64 GiB of CPU RAM as a second KV-cache tier (~1.32M tokens), so conversations evicted from the GPU reload in seconds instead of being recomputed. |
+| `PLE_INT4` | int4 n-gram table sidecar (~32 GB) | The n-gram table, served from host memory by the CPU offload worker. The fp8 sidecar (52.5 GB) is ~3× cleaner per row, but measured gains were small (general text within noise; −0.41 % NLL on identifier/digit-heavy text, ~1.5 SE); int4 keeps ~20 GB more RAM free. |
+| `EXTRA_ARGS` | `--prefix-cache-retention-interval 6272 --max-num-seqs 2 --kv-offloading-size 48` | Retain linear-attention state every 8 blocks along long prompts, for faster follow-up turns; at most 2 requests run at once (the rest queue); 48 GiB of CPU RAM as a second KV-cache tier (~960k tokens), so conversations evicted from the GPU reload in seconds instead of being recomputed. |
 | `VLLM_USE_SIMPLE_KV_OFFLOAD` | `1` | Required with this model for the CPU tier (see [`docs/rdna2/CHANGES.md`](docs/rdna2/CHANGES.md) §19). |
 | `PLE_OFFLOAD_ANON` | `1` | The n-gram worker keeps the 52.5 GB table in its own memory, not the page cache, so memory pressure can't evict it. Required with the CPU tier: without it, evicted table pages made lookups take seconds and desynchronised the cards. |
 | `VLLM_RDNA_AR` | `1` | Custom one-shot all-reduce for decode-sized messages. |
@@ -92,21 +92,17 @@ variable is explained in [`docs/rdna2/ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md
 | `NCCL_P2P_LEVEL`, `NCCL_GRAPH_MIXING_SUPPORT` | `SYS`, `1` | Set by the serve script: direct card-to-card RCCL, and correct graph and eager mixing. |
 | TunableOp | lookup-only | Tuned GEMM rows for the installed rocBLAS build; never tuned while serving. |
 
-**Host memory budget.** With the CPU tier, RAM is committed explicitly: 64 GiB pinned for the tier, 52.5 GB for the
-n-gram table, ~6 GB per GPU worker, plus whatever else the host runs. About 15 GB of the 188 GB stays available. Size
-`--kv-offloading-size` so `MemAvailable` keeps a margin for the rest of the system.
+**Host memory budget.** With the CPU tier, RAM is committed explicitly: the pinned tier, the resident n-gram table,
+~6 GB per GPU worker, plus whatever else the host runs. 64 GiB of tier with the fp8 table left only ~15 GB of the
+188 GB available, so production runs 48 GiB with the int4 table (~32 GB). Size `--kv-offloading-size` so
+`MemAvailable` keeps a margin for the rest of the system.
 
-Single-stream decode is about 59.5 tokens/s at the production operating point. The published container,
-with its defaults, reaches about 64 tokens/s on the same cards. The gap is a deliberate quality choice:
-
-- **The fp8 n-gram table**, about 52 GB. The container uses the int4 table, about 32 GB. Each decode step
-  waits on a lookup from the CPU worker, and fp8 rows are twice the size, so lookups take about 5 ms
-  instead of about 2 ms.
-- **The full 262k context.** The container uses 131k. Decode runs as captured CUDA graphs, so the
-  sparse-attention indexer scores against the full page-table capacity, which scales with the maximum
-  context length.
-
-Switching to the int4 table and a 131k context would recover the ~5 tokens/s. Prefill throughput depends on prompt length and concurrency, averaging about
+Single-stream decode is about 59.5 tokens/s at the production operating point; the published container, with its
+defaults, reaches about 64 tokens/s on the same cards. The likeliest contributor is the full **262k context** (the
+container uses 131k): decode runs as captured CUDA graphs, so the sparse-attention indexer scores against the full
+page-table capacity, which scales with the maximum context length. The table format is not the cause: measured
+09-16, a warm fp8 lookup was cheaper than int4 (0.08–0.14 vs 0.24–0.34 ms) and fp8 decode was 63.7–64.0 vs int4
+62.6 t/s in the same session. Not separately measured: vision on, int8-only weights, and the CPU tier. Prefill throughput depends on prompt length and concurrency, averaging about
 1,150–1,250 tokens/s under our mixed multi-request load test.
 
 ## Kernel command line
