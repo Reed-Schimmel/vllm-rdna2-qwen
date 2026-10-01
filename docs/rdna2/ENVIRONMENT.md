@@ -163,6 +163,15 @@ Any `VLLM_RDNA_QSA_*` override is logged as a warning at startup.
 
 ---
 
+## 7b. CPU KV-cache offload (§19)
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `--kv-offloading-size N` (vLLM argument, e.g. via `EXTRA_ARGS`) | off | Keep N GiB (total across all TP ranks) of pinned CPU RAM as a second KV-cache tier. Prefixes evicted from the GPU reload from RAM instead of being recomputed. |
+| `VLLM_USE_SIMPLE_KV_OFFLOAD` | `0` | **Set to `1` with this model.** Selects `SimpleCPUOffloadConnector`, which reuses vLLM's prefix-cache logic for every cache group. The default `OffloadingConnector` refuses to start on the QSA compressor ring (`tokens_per_block=4 not divisible by tokens_per_hash=784`). |
+
+---
+
 ## 8. N-gram table offload (PLE) (§3, §8a, §8c)
 
 The model's per-layer n-gram embedding table has about 51 billion rows, far too large for the cards. A

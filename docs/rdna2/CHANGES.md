@@ -823,3 +823,35 @@ two of three runs (at 112 s and 205 s, ~170 W cap).
 Not yet shown: the same result at the higher power cap the host-mode drops happened at, and a longer or more
 decode-heavy load. If wide mode ever drops a card, the next variable is flow count (12 simultaneous flows against 4
 in RCCL's ring); a ring-ordered variant would test that.
+
+## 19. CPU KV-cache offload, `--kv-offloading-size` with `VLLM_USE_SIMPLE_KV_OFFLOAD=1` (2026-10-01)
+
+vLLM can keep a second KV-cache tier in pinned CPU RAM. Every computed block is also copied to RAM; when a prefix has
+been evicted from the GPU, a later request with that prefix reloads it from RAM instead of recomputing it. For several
+agents with long contexts sharing ~520k tokens of GPU cache, that replaces minute-long recomputes with ~1–2 s reloads.
+
+**Use the simple connector.** `--kv-offloading-size N` selects vLLM's default `OffloadingConnector`, which fails at
+startup on this model: `tokens_per_block=4 not divisible by tokens_per_hash=784`. The 4-token group is the QSA
+indexer's compressor ring (`CircularBufferSpec`, not prefix-cacheable), and that connector asserts on every group and
+has no case for ring buffers. `VLLM_USE_SIMPLE_KV_OFFLOAD=1` selects `SimpleCPUOffloadConnector` instead. It mirrors the
+GPU cache configuration on the CPU side and reuses vLLM's own prefix-cache coordinator, so the linear-attention state,
+the compressed sparse-attention keys and the ring are handled exactly as for GPU prefix caching. No code change needed.
+
+**Sizing.** `N` is GiB **in total across the TP ranks** (64 → 16 GiB per rank → 1,678 blocks of 784 tokens ≈ 1.32M
+tokens). The cache costs ~54 KB per token summed over 4 ranks. RAM holds a copy of what is on the GPU, so the extra
+resumable context is roughly (CPU tokens − GPU tokens): 32 GiB adds little over the GPU's ~520k; 64 GiB about 800k. The
+pinned memory comes out of the page cache, so check that anything else that must stay resident (the n-gram table) still
+is: with 64 GiB pinned on a 188 GB host the 52.5 GB fp8 table stayed 100 % resident (`fincore`).
+
+**Tests** (4× V620, 110 W, 2250 MHz ceiling; `bench/kv-offload/` in the research repo):
+
+- Reloads: 83k-token prompts evicted from the GPU reloaded with TTFT **1.1–1.2 s vs 64–68 s** fresh; 40k-token prompts
+  **1.6–2.7 s vs 37–38 s**. The tier served 100 % of the prompt tokens (external prefix-cache hits), over two eviction
+  cycles; least-recently-used prompts correctly fell out of RAM once the tier filled.
+- Correctness: **this engine is not run-to-run deterministic at long context**: two GPU prefix-cache hits of the same
+  40k prompt diverge at a near-tie (token ~10 / ~32), with logprob differences up to 0.27 before divergence. So the bar is
+  "indistinguishable from a GPU hit": reloads diverge from GPU runs no earlier than GPU runs diverge from each other (A 9–10
+  vs 10, B 32 vs 32), all outputs coherent, mean logprob of 64 tokens −0.18 to −0.26 for every path (CPU within 0.06 of
+  GPU). Corrupted KV would show up as garbage or a confidence collapse from the first token; none was seen.
+- Load: a 240 s, 4-worker mixed soak (503k prompt tokens) with offload active: 0 errors, no kernel events.
+- Decode unchanged: 63.0 t/s single stream (MTP 0, 262k context, fp8 n-gram table).

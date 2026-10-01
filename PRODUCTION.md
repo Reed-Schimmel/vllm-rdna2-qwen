@@ -79,7 +79,8 @@ variable is explained in [`docs/rdna2/ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md
 | `DENSE_INT8`, `DENSE_INT8_ONLY` | `1`, `1` | int8 copies of the dense projections for decode, and the fp16 copies freed (more KV cache). |
 | `VISION` | `1` | Image input enabled. |
 | `PLE_INT4` | fp8 n-gram table sidecar | The n-gram table served from host memory by the CPU offload worker. |
-| `EXTRA_ARGS` | `--prefix-cache-retention-interval 6272` | Retain linear-attention state every 8 blocks along long prompts, for faster follow-up turns. |
+| `EXTRA_ARGS` | `--prefix-cache-retention-interval 6272 --max-num-seqs 2 --kv-offloading-size 64` | Retain linear-attention state every 8 blocks along long prompts, for faster follow-up turns; at most 2 requests run at once (the rest queue); 64 GiB of CPU RAM as a second KV-cache tier (~1.32M tokens), so conversations evicted from the GPU reload in seconds instead of being recomputed. |
+| `VLLM_USE_SIMPLE_KV_OFFLOAD` | `1` | Required with this model for the CPU tier (see [`docs/rdna2/CHANGES.md`](docs/rdna2/CHANGES.md) §19). |
 | `VLLM_RDNA_AR` | `1` | Custom one-shot all-reduce for decode-sized messages. |
 | `VLLM_RDNA_AR_MODE` | `wide` | 16-byte writes forming whole 128-byte lines, writes only, local waiting. The serve script's default. |
 | `VLLM_RDNA_AR_BLOCKS`, `VLLM_RDNA_AR_PACE` | `4`, `16` | Fewer concurrent write streams, with spacing between bursts. |
