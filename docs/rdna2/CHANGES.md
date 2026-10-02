@@ -878,3 +878,78 @@ of production with the 64 GiB tier, a long agent turn hung: decode stopped, rank
 - **Memory budget is now explicit:** pinned tier + table + workers. On the 188 GB host with 64 GiB pinned, ~15 GB stays
   available. Size the tier so `MemAvailable` keeps a margin; anything that then runs the host out of memory hits the
   OOM killer, where the largest process is the n-gram worker.
+
+### 19b. Lazy offload made to work on this model; offload tier made unmovable (2026-10-01, evening)
+
+**Lazy mode.** `--kv-transfer-config '{"kv_connector_extra_config":{"lazy_offload":true}}'` copies a block to RAM
+only when it is about to be evicted from the GPU, so GPU and RAM hold different prefixes and the resumable total is
+roughly GPU + RAM instead of RAM alone. Upstream's implementation served **0 %** from RAM on this model (capacity test:
+one 48k prompt, then 819k distinct tokens; `vllm:external_prefix_cache_hits_total` stayed 0). Eight problems, fixed in
+`vllm/v1/simple_kv_offload/manager.py` (`VLLM_RDNA_OFFLOAD_LAZY_CURSOR=1` restores the upstream walk):
+
+1. **Window size.** The number of GPU blocks kept "safe to evict" was computed per cache group as
+   `max_num_batched_tokens / block_size`. The QSA compressor ring (`CircularBufferSpec`, 4-token blocks) alone gave
+   512, for a window of 1,046 blocks — the whole free queue — so every block was copied as soon as it was freed (eager
+   behaviour). The ring holds one never-cached block per request; it now counts 1. Window 24, or
+   `VLLM_RDNA_OFFLOAD_LAZY_TARGET` (96 recommended: covers the allocation burst of reloading a ~48k prompt).
+2. **Cursor ran ahead.** The walk resumed from where it stopped and covered another window's worth every step, so
+   over a 24-step prefill it reached deep into the queue. Now measured from the head (next to be evicted) every step.
+3. **Copied blocks went back to the MRU end.** The copy pins the GPU block; releasing it appended it to the tail of
+   the LRU, so every copied block stayed on the GPU for another full cycle (tiers inclusive again). Now returned to
+   the head: it is next to be evicted, and safe in RAM.
+4. **In-flight copies not counted.** Pinned blocks leave the free queue, so each step walked past them; a reload
+   followed by decode copied ~390 blocks in seconds and the RAM tier's LRU dropped another prefix. The window now
+   subtracts blocks still being copied.
+5. **RAM recency not refreshed.** A block already in RAM (a reloaded prefix that was used again) was skipped as it
+   left the GPU, so its RAM copy kept its old position and was dropped first. Its RAM copy is now moved to most
+   recently used as the GPU copy leaves (once per 512 steps per block).
+
+6. **Blocks lost at eviction.** The window is a heuristic: a block can still reach the allocator uncopied (window
+   used up by in-flight copies, or one allocation larger than the window, e.g. admitting a long reload). One lost
+   block cuts every prefix through it (measured: a 178k prompt split GPU 0–15 / RAM 17+, block 16 nowhere → full
+   recompute). The allocator's eviction now hands such a block a RAM block, and the worker copies it at the very start
+   of the step (`Worker.execute_model`, before the model runner zeroes newly allocated blocks), on the compute stream;
+   the step's loads wait for it. The RAM copy becomes findable two steps later, when it has certainly completed even
+   with async scheduling. `VLLM_RDNA_OFFLOAD_LAZY_RESCUE=0` disables this and fix 7.
+7. **Half a prefix on each side.** vLLM frees a request's blocks tail first, so a prefix's head stays on the GPU
+   longest, but on this model a GPU hit also needs a Mamba state at or before its end (every 6,272 tokens), and a RAM
+   hit has to continue from where the GPU hit stops. Measured: GPU kept blocks 0–1 (no state → no GPU hit), RAM had 2+
+   (no block 0 → no RAM hit), a 178k reload recomputed everything. Now, when any attention block is copied, its prefix
+   ancestors still on the GPU are copied with it (each request's block chain is recorded when it finishes), together
+   with the Mamba state blocks of the same prefix positions. After that the 178k reload took **2.2 s instead of
+   ~155 s**.
+
+8. **RAM-tier eviction order.** A RAM hit needs an unbroken prefix, so the RAM tier's LRU must evict a prefix from its
+   tail and order prefixes by when they were last *used*, not when they were copied. Three measured failures and the
+   rules that fixed them: blocks at the Mamba retention positions reached RAM early (co-copied when the walk met a
+   Mamba block first) and were evicted first, so every 8th block of a prompt vanished; refreshing RAM copies on GPU
+   eviction kept bumping an old 178k prompt that left the GPU a few blocks per step; copies placed at the MRU end
+   ranked prompts used *before* a reloaded target as newer than it. Now: each request's block chain (parent keys)
+   and its last-use step are recorded; a newly copied block goes just before its parent (Mamba blocks before the
+   attention block of their position), a new prefix is inserted by its last-use step, blocks that can never be hit
+   (parent neither in RAM nor on the GPU) go to the eviction end, and a request using a prefix moves the whole
+   prefix, tail first, to the most-recent end.
+
+Capacity note: Mamba state snapshots occupy blocks too (~94 per 48k prompt, not 62), so a 48 GiB tier (1,258 blocks)
+holds ~13 such prompts (~630k tokens) and the GPU ~7.
+
+**Multi-second stalls: KFD queue eviction on page migration.** Under load all ranks sometimes took 5–20 s for one
+step (`PLE lookup … has taken >5 s` on the ranks waiting for rank 0). `/sys/class/kfd/kfd/proc/<pid>/stats_<gpu>/
+evicted_ms` showed ~120 s of accumulated queue eviction per worker in one run. The tier is registered with
+`cudaHostRegister`, which on ROCm makes it a KFD *userptr*: the pages stay movable. When the kernel migrates any page
+of it (memory compaction), KFD stops every queue of the process and re-faults and re-maps the **whole** registration
+before resuming — 12 GB per rank took 5–20 s. Eviction jumps line up with `pgmigrate_success` jumps.
+(`hipHostMalloc` does not avoid it: ROCr backs it with shared memory registered the same way.) Mitigations, all in
+`cuda_mem_ops.py`/`worker.py`:
+
+- Register in block-aligned ~128 MB chunks (`VLLM_RDNA_OFFLOAD_PIN_CHUNK_MB`, 0 = one piece): an invalidation
+  revalidates one chunk. Copies are per block, so none crosses a chunk.
+- Back the tier with transparent huge pages (`VLLM_RDNA_OFFLOAD_THP`, default on): compaction skips 2 MB pages.
+  Coverage depends on fragmentation at allocation time (35–60 % measured).
+- `mlock` the tier and `mlockall(ONFAULT)` the worker (`VLLM_RDNA_OFFLOAD_MLOCK`, default on): with
+  `vm.compact_unevictable_allowed=0` compaction skips locked pages entirely, including ROCr's own ~2.5 GB of host
+  allocations per worker, which are movable userptrs too.
+- **Host settings required** (otherwise the code only logs a warning): `RLIMIT_MEMLOCK` ≥ tier per rank + ~3 GB
+  (unlimited is simplest) for the vLLM process, `vm.compact_unevictable_allowed=0`, and preferably
+  `vm.compaction_proactiveness=0` (background compaction was the largest source of migrations). See
+  `hwconfig/README.md`.

@@ -170,6 +170,14 @@ Any `VLLM_RDNA_QSA_*` override is logged as a warning at startup.
 | `--kv-offloading-size N` (vLLM argument, e.g. via `EXTRA_ARGS`) | off | Keep N GiB (total across all TP ranks) of pinned CPU RAM as a second KV-cache tier. Prefixes evicted from the GPU reload from RAM instead of being recomputed. |
 | `VLLM_USE_SIMPLE_KV_OFFLOAD` | `0` | **Set to `1` with this model.** Selects `SimpleCPUOffloadConnector`, which reuses vLLM's prefix-cache logic for every cache group. The default `OffloadingConnector` refuses to start on the QSA compressor ring (`tokens_per_block=4 not divisible by tokens_per_hash=784`). |
 | `VLLM_RDNA_OFFLOAD_TIMING` | `0` | Diagnostic: log each offload copy's duration, and every worker step slower than `VLLM_RDNA_OFFLOAD_TIMING_SLOW_MS` (default 500), with whether a copy overlapped it. |
+| `--kv-transfer-config '{"kv_connector_extra_config":{"lazy_offload":true}}'` | eager | Lazy mode: copy a block to RAM only when it is about to leave the GPU, so the two tiers hold different prefixes (resumable ≈ GPU + RAM instead of RAM alone). Works on this model only with the fork's fixes (§19b). |
+| `VLLM_RDNA_OFFLOAD_LAZY_TARGET` | computed (24 here) | Lazy mode: GPU blocks at the eviction end kept copied to RAM. 96 covers the allocation burst of reloading a ~48k-token prompt; larger reloads may lose some old tails. |
+| `VLLM_RDNA_OFFLOAD_LAZY_CURSOR` | `0` | `1` restores upstream's lazy walk (§19b fixes off). For comparison only. |
+| `VLLM_RDNA_OFFLOAD_LAZY_RESCUE` | `1` | Lazy mode: copy a cached block the GPU allocator evicts before it was offloaded (at the start of the step), and copy a block's prefix ancestors and Mamba states with it so RAM hits are contiguous (§19b items 6–7). |
+| `VLLM_RDNA_OFFLOAD_PIN_CHUNK_MB` | `128` | Register the RAM tier with the GPU driver in block-aligned chunks of about this size, so a page migration revalidates one chunk instead of the whole tier. `0` = one registration (upstream). |
+| `VLLM_RDNA_OFFLOAD_THP` | `1` | Back the RAM tier with transparent huge pages (`MADV_HUGEPAGE`), which memory compaction does not move. |
+| `VLLM_RDNA_OFFLOAD_MLOCK` | `1` | `mlock` the RAM tier and `mlockall(ONFAULT)` the GPU worker so compaction cannot migrate pages the GPU has mapped (each migration stalls all of that rank's GPU queues). Needs `RLIMIT_MEMLOCK` ≥ tier per rank + ~3 GB and `vm.compact_unevictable_allowed=0`; logs a warning and continues otherwise. |
+| `VLLM_RDNA_OFFLOAD_DEBUG` | `0` | Diagnostic: per cache group, lazy-walk counts every 30 s, and for a long request with no RAM hit, which group's blocks are missing. |
 
 ---
 

@@ -3,6 +3,7 @@
 """Scheduler-side manager for SimpleCPUOffloadConnector."""
 
 import contextlib
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
@@ -13,6 +14,11 @@ from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_utils import (
+    get_block_hash,
+    get_group_id,
+    make_block_hash_with_group_id,
+)
 from vllm.v1.core.kv_cache_coordinator import (
     KVCacheCoordinator,
     get_kv_cache_coordinator,
@@ -24,6 +30,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.simple_kv_offload import debug as _offload_debug
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
     SimpleCPUOffloadWorkerMetadata,
@@ -36,6 +43,12 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# gfx1030 fork: upstream lazy walk resumed from a cursor (see
+# _prepare_lazy_store_specs). 1 restores it.
+_LAZY_RESUME_CURSOR = os.getenv("VLLM_RDNA_OFFLOAD_LAZY_CURSOR", "0") == "1"
+# gfx1030 fork: copy blocks the allocator evicts uncopied (see _on_gpu_evict).
+_LAZY_RESCUE = os.getenv("VLLM_RDNA_OFFLOAD_LAZY_RESCUE", "1") == "1"
 
 
 @dataclass
@@ -123,6 +136,8 @@ class SimpleCPUOffloadScheduler:
             "lazy" if lazy_offload else "eager",
             "disk" if disk_capacity_bytes > 0 else "cpu",
         )
+        if _offload_debug.ENABLED:
+            _offload_debug.describe_groups(self.cpu_kv_cache_config)
 
         spec_config = vllm_config.speculative_config
         use_eagle = spec_config is not None and spec_config.use_eagle()
@@ -158,12 +173,32 @@ class SimpleCPUOffloadScheduler:
         self._lazy_mode = lazy_offload
         # Lazy mode: use a cursor to track the last scanned block in the GPU free queue.
         self._cursor: KVCacheBlock | None = None
+        self._lazy_steps = 0
+        self._lazy_step_marks: dict[int, tuple] = {}
+        self._parent_key: dict = {}
+        self._chain_refresh_marks: dict = {}
+        self._refresh_covered: set = set()
+        self._root_of: dict = {}  # attention key -> key of its prompt's first block
+        self._use_stamp: dict = {}  # prompt root key -> scheduler step of last use
+        self._cpu_stamp: dict[int, int] = {}  # RAM block id -> last-use stamp
+        # Eviction-time rescue (see _on_gpu_evict).
+        self._rescue_gpu: list[int] = []
+        self._rescue_cpu: list[int] = []
+        self._rescue_keys: set = set()
+        self._rescue_maturing: list[tuple[int, list[int]]] = []
+        self._maturing_keys: set = set()
+        self._chain: dict[int, tuple] = {}
+        self._costore_groups: list[int] = []
+        self._meta_steps = 0
+        self._rescue_stats = [0, 0, 0]  # rescued, co-stored, lost (no CPU block)
         if self._lazy_mode:
             self._target_free = self._estimate_lazy_target_blocks(
                 kv_cache_config,
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 self.cp_world_size,
             )
+            logger.info("SimpleCPUOffloadScheduler: lazy store window %d GPU blocks",
+                        self._target_free)
         else:
             self._target_free = 0
         self._store_event_to_blocks: dict[int, TransferMeta] = {}
@@ -231,16 +266,177 @@ class SimpleCPUOffloadScheduler:
             block_size = spec.block_size * cp_world_size
             if isinstance(spec, MambaSpec):
                 target += 2
+            elif not getattr(spec, "prefix_cacheable", True):
+                # gfx1030 fork: e.g. CircularBufferSpec (QSA ring, block_size
+                # 4): one block per request for its lifetime, never cached.
+                # Counting it as max_num_batched_tokens / 4 gave a window of
+                # ~1000 blocks -- the whole free queue -- so lazy stored every
+                # block as soon as it was freed (eager behaviour, no extra
+                # capacity) and the CPU tier's LRU dropped older prefixes.
+                target += 1
             elif isinstance(spec, SlidingWindowSpec):
                 target += cdiv(spec.sliding_window, block_size) + 1
             else:
                 target += cdiv(max_num_batched_tokens, block_size)
+        override = int(os.getenv("VLLM_RDNA_OFFLOAD_LAZY_TARGET", "0"))
+        if override > 0:
+            return override
         return int(target * (1 + WATERMARK_RATIO))
 
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         """Bind GPU block pool so that we can touch blocks during stores.
         Called by Scheduler after kv_cache_manager is ready."""
         self._gpu_block_pool = gpu_block_pool
+        if self._lazy_mode and not _LAZY_RESUME_CURSOR and _LAZY_RESCUE:
+            evict = gpu_block_pool._maybe_evict_cached_block
+
+            def evict_with_rescue(block: "KVCacheBlock") -> bool:
+                self._on_gpu_evict(block)
+                return evict(block)
+
+            gpu_block_pool._maybe_evict_cached_block = evict_with_rescue  # type: ignore[method-assign]
+            self._costore_groups = [
+                g for g, grp in enumerate(self.cpu_kv_cache_config.kv_cache_groups)
+                if grp.kv_cache_spec.block_size * self.cp_world_size == self.hash_block_size
+                and getattr(grp.kv_cache_spec, "prefix_cacheable", True)
+            ]
+
+    def _on_gpu_evict(self, block: "KVCacheBlock") -> None:
+        """gfx1030 fork: the GPU allocator is about to reuse a cached block.
+
+        The lazy walk copies blocks shortly before they reach the eviction end,
+        but a block can still be evicted uncopied (window used up by in-flight
+        copies, or one allocation larger than the window, e.g. admitting a long
+        reload). One lost block cuts every prefix through it: measured, a 178k
+        prompt split GPU 0-15 / CPU 17+ with block 16 nowhere -> full recompute.
+        Here the block gets a CPU block now and the worker copies it at the
+        start of this step, before the block is zeroed for its new owner.
+
+        Also copies the same-prefix blocks of the other groups still cached on
+        the GPU (Mamba state snapshots age separately in the LRU): a CPU hit
+        needs the state at its end position in RAM, not on the GPU.
+        """
+        bhash = block.block_hash
+        if bhash is None or block.is_null:
+            return
+        cpu_pool = self.cpu_block_pool
+        hit = cpu_pool.cached_block_hash_to_block.get_one_block(bhash)
+        if hit is not None:
+            return  # already in RAM (recency is set on use: see _note_use)
+        for src, key in self._plan_copies(block, bhash, self._rescue_keys):
+            if cpu_pool.get_num_free_blocks() == 0:
+                self._rescue_stats[2] += 1
+                continue
+            cpu_blk = cpu_pool.get_new_blocks(1)[0]
+            cpu_blk._block_hash = key  # type: ignore[assignment]
+            self._rescue_gpu.append(src.block_id)
+            self._rescue_cpu.append(cpu_blk.block_id)
+            self._rescue_stats[0 if src is block else 1] += 1
+
+    def _plan_copies(self, block: "KVCacheBlock", bhash, exclude: set) -> list:
+        """gfx1030 fork: what to copy to CPU along with ``block``.
+
+        A CPU hit on this hybrid model needs, from the point where the GPU hit
+        ends, every attention block of the prefix plus the Mamba state at the
+        hit's end -- all in RAM. vLLM frees a request's blocks tail first, so
+        the head of a prefix stays on the GPU longest, yet without a Mamba
+        state near the start it gives no GPU hit (measured: GPU kept blocks
+        0-1, RAM had 2+, reload recomputed 178k tokens). So with a block also
+        copy (a) the same-prefix blocks of the other cacheable groups still on
+        the GPU and (b) its prefix ancestors still on the GPU (recorded per
+        request in _record_chain), each with (a). Keys in ``exclude`` or already
+        in RAM are skipped; chosen keys are added to ``exclude``.
+        """
+        out: list = []
+        cached = self.cpu_block_pool.cached_block_hash_to_block
+        gpu_pool = self._gpu_block_pool
+        gpu_cached = gpu_pool.cached_block_hash_to_block
+
+        def want(key) -> bool:
+            return (key not in exclude and key not in self._maturing_keys
+                    and cached.get_one_block(key) is None)
+
+        def add_position(src, key) -> None:
+            if want(key):
+                out.append((src, key))
+                exclude.add(key)
+            raw, gk = get_block_hash(key), get_group_id(key)
+            for g in self._costore_groups:
+                if g == gk:
+                    continue
+                k2 = make_block_hash_with_group_id(raw, g)
+                if not want(k2):
+                    continue
+                b2 = gpu_cached.get_one_block(k2)
+                if b2 is not None and not b2.is_null:
+                    out.append((b2, k2))
+                    exclude.add(k2)
+
+        add_position(block, bhash)
+        # Follow the prefix from this position's attention block (also when the
+        # walk met a Mamba block first: its attention block's ancestors are
+        # needed just the same).
+        head = block
+        if get_group_id(bhash) != self.fa_gidx:
+            k_fa = make_block_hash_with_group_id(get_block_hash(bhash), self.fa_gidx)
+            head = gpu_cached.get_one_block(k_fa)
+            bhash = k_fa
+        entry = self._chain.get(head.block_id) if head is not None else None
+        if entry is not None and entry[0] == bhash:
+            prev, n = entry[1], 0
+            while prev >= 0 and n < 4096:
+                e = self._chain.get(prev)
+                b = gpu_pool.blocks[prev]
+                if e is None or b.block_hash != e[0] or b.is_null:
+                    break  # ancestor evicted/reused: chain ends on the GPU
+                if cached.get_one_block(e[0]) is not None:
+                    break  # ancestor already in RAM (and its ancestors, normally)
+                add_position(b, e[0])
+                prev, n = e[1], n + 1
+        return out
+
+    def _record_chain(self, block_ids: tuple[list[int], ...]) -> None:
+        """Remember each attention block's predecessor for _plan_copies."""
+        if not (self._lazy_mode and not _LAZY_RESUME_CURSOR and _LAZY_RESCUE):
+            return
+        if self.fa_gidx >= len(block_ids):
+            return
+        pool = self._gpu_block_pool
+        prev = -1
+        prev_key = None
+        if len(self._parent_key) > 400_000:
+            self._parent_key.clear()
+            self._chain_refresh_marks.clear()
+        root = None
+        if len(self._root_of) > 400_000:
+            self._root_of.clear()
+        for bid in block_ids[self.fa_gidx]:
+            blk = pool.blocks[bid]
+            if blk.is_null or blk.block_hash is None:
+                break
+            self._chain[bid] = (blk.block_hash, prev)
+            self._parent_key[blk.block_hash] = prev_key
+            root = root or blk.block_hash
+            self._root_of[blk.block_hash] = root
+            if _offload_debug.ENABLED:
+                _offload_debug.note_root(blk.block_hash, root)
+            prev, prev_key = bid, blk.block_hash
+        if root is not None:
+            self._use_stamp[root] = self._lazy_steps  # last use: finished now
+
+    def _mature_rescues(self) -> None:
+        """Make rescued CPU blocks findable two steps after their copy was
+        issued: by then the copy (enqueued before that step's forward) has
+        completed, even with one step of async scheduling overlap."""
+        self._meta_steps += 1
+        cpu_pool = self.cpu_block_pool
+        while self._rescue_maturing and self._rescue_maturing[0][0] <= self._meta_steps - 2:
+            _, cpu_ids = self._rescue_maturing.pop(0)
+            blocks = [cpu_pool.blocks[b] for b in cpu_ids]
+            for b in blocks:
+                cpu_pool.cached_block_hash_to_block.insert(b.block_hash, b)
+                self._maturing_keys.discard(b.block_hash)
+            self._place_new_cpu_blocks(blocks)
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -256,6 +452,17 @@ class SimpleCPUOffloadScheduler:
 
         num_skipped_hashes = num_computed_tokens // self.hash_block_size
         remaining_hashes = request.block_hashes[num_skipped_hashes:]
+        if request.block_hashes and self._lazy_mode and not _LAZY_RESUME_CURSOR and _LAZY_RESCUE:
+            # gfx1030 fork: a request uses its prefix -> RAM copy to MRU (whole
+            # prefix, tail to head). RAM recency follows last use; refreshing
+            # on GPU eviction instead kept bumping a long prompt that leaves the
+            # GPU a few blocks per step, past newer prefixes (measured: a 178k
+            # prompt last used before A outlived A's tail).
+            self._use_stamp[make_block_hash_with_group_id(request.block_hashes[0], self.fa_gidx)] = (
+                self._lazy_steps)
+            self._refresh_chain(
+                make_block_hash_with_group_id(request.block_hashes[-1], self.fa_gidx),
+                self._refresh_covered, force=True)
 
         if not remaining_hashes:
             return 0, False
@@ -267,6 +474,15 @@ class SimpleCPUOffloadScheduler:
         cpu_hit_blocks, hit_length, _ = self.cpu_coordinator.find_longest_cache_hit(
             remaining_hashes, max_hit_len
         )
+        if _offload_debug.ENABLED and len(request.block_hashes) >= 8:
+            k0 = make_block_hash_with_group_id(request.block_hashes[0], self.fa_gidx)
+            logger.info("offload-debug: lookup %s prompt %s: GPU hit %d tok, RAM hit %d of %d tok",
+                        request.request_id[:24], bytes(k0)[:3].hex(), num_computed_tokens,
+                        hit_length, max_hit_len)
+            if 0 < hit_length < 0.95 * max_hit_len:
+                _offload_debug.explain_miss(request, remaining_hashes, self.cpu_block_pool,
+                                            self.cpu_kv_cache_config, self.hash_block_size,
+                                            self._gpu_block_pool)
 
         if hit_length > 0:
             pin_blocks = [
@@ -278,6 +494,10 @@ class SimpleCPUOffloadScheduler:
                 hit_length,
             )
             return hit_length, True
+        if _offload_debug.ENABLED and len(remaining_hashes) >= 8:
+            _offload_debug.explain_miss(request, remaining_hashes, self.cpu_block_pool,
+                                        self.cpu_kv_cache_config, self.hash_block_size,
+                                        self._gpu_block_pool)
         return 0, False
 
     # TODO(yifan): this API now only matches the suffix part of the prefix cache. A more
@@ -409,6 +629,16 @@ class SimpleCPUOffloadScheduler:
         self,
         scheduler_output: SchedulerOutput,
     ) -> SimpleCPUOffloadMetadata:
+        # --- Eviction-time rescues (lazy) ---
+        self._refresh_covered = set()
+        self._mature_rescues()
+        rescue_gpu, rescue_cpu = self._rescue_gpu, self._rescue_cpu
+        if rescue_cpu:
+            self._rescue_maturing.append((self._meta_steps, list(rescue_cpu)))
+            self._maturing_keys.update(self._rescue_keys)
+            self._rescue_gpu, self._rescue_cpu = [], []
+        self._rescue_keys = set()
+
         # --- Stores ---
         store_event = -1
         store_gpu, store_cpu, store_req_ids = self.prepare_store_specs(scheduler_output)
@@ -444,6 +674,9 @@ class SimpleCPUOffloadScheduler:
                 self._reqs_to_load[req_id].load_event = load_event
             self._load_event_to_reqs[load_event] = load_req_ids
 
+        if _offload_debug.ENABLED:
+            cpu_blocks = self.cpu_block_pool.blocks
+            _offload_debug.note_stored(cpu_blocks[b].block_hash for b in store_cpu + rescue_cpu)
         result = SimpleCPUOffloadMetadata(
             load_event=load_event,
             load_gpu_blocks=load_gpu,
@@ -456,6 +689,8 @@ class SimpleCPUOffloadScheduler:
             store_gpu_blocks=store_gpu,
             store_cpu_blocks=store_cpu,
             need_flush=bool(scheduler_output.preempted_req_ids),
+            rescue_gpu_blocks=rescue_gpu,
+            rescue_cpu_blocks=rescue_cpu,
         )
         return result
 
@@ -467,6 +702,128 @@ class SimpleCPUOffloadScheduler:
             return self._prepare_lazy_store_specs()
         else:
             return self._prepare_eager_store_specs(scheduler_output)
+
+    def _place_new_cpu_blocks(self, blocks: list) -> None:
+        """gfx1030 fork: release freshly copied RAM blocks into the RAM LRU
+        relative to their prefix instead of at the MRU end.
+
+        Each attention block goes just before (older than) its parent block if
+        that is in RAM, so a prefix is evicted tail first; Mamba blocks go just
+        before the attention block of their position. Blocks without a parent
+        in RAM are appended (new prefix). Only a request using a prefix moves
+        it as a whole (_refresh_chain from get_num_new_matched_tokens) --
+        appending copies at MRU instead let a new tail block, written while an
+        old 178k prompt was decoded again, drag that whole prompt past newer
+        ones.
+        """
+        q = self.cpu_block_pool.free_block_queue
+        cached = self.cpu_block_pool.cached_block_hash_to_block
+        gpu_cached = self._gpu_block_pool.cached_block_hash_to_block
+        fa = self.fa_gidx
+
+        stamps = self._cpu_stamp
+        now = self._lazy_steps
+
+        def insert_before(b, nxt) -> None:
+            prev = nxt.prev_free_block
+            b.prev_free_block, b.next_free_block = prev, nxt
+            prev.next_free_block = b
+            nxt.prev_free_block = b
+            q.num_free_blocks += 1
+
+        def last_use(b) -> int:
+            k = b.block_hash
+            if get_group_id(k) != fa:
+                k = make_block_hash_with_group_id(get_block_hash(k), fa)
+            root = self._root_of.get(k)
+            return self._use_stamp.get(root, now) if root is not None else now
+
+        def release(b, anchor_key, is_root: bool) -> None:
+            b.ref_cnt -= 1
+            if b.ref_cnt > 0 or b.is_null:
+                return
+            anchor = cached.get_one_block(anchor_key) if anchor_key is not None else None
+            if (anchor is not None and anchor is not b and anchor.ref_cnt == 0
+                    and anchor.prev_free_block is not None):
+                insert_before(b, anchor)
+                stamps[b.block_id] = stamps.get(anchor.block_id, now)
+            elif (not is_root and anchor_key is not None
+                  and gpu_cached.get_one_block(anchor_key) is None):
+                # Orphan: its parent (or, for a Mamba block, the attention
+                # block of its position) is neither in RAM nor on the GPU, so
+                # it can never be hit -- evict it first instead of letting it
+                # outlive real prefixes.
+                q.prepend_n([b])
+                stamps[b.block_id] = -1
+            else:
+                # New prefix start (or anchor still on the GPU): rank by the
+                # prompt's last use, not by copy time -- a prompt used before A
+                # but copied after A must still be evicted before A.
+                s = last_use(b)
+                cur = q.fake_free_list_tail
+                while (cur.prev_free_block is not q.fake_free_list_head
+                       and stamps.get(cur.prev_free_block.block_id, -1) > s):
+                    cur = cur.prev_free_block
+                insert_before(b, cur)
+                stamps[b.block_id] = s
+
+        # Copy order is tail first; place head first so parents are in place.
+        attn = [b for b in blocks if get_group_id(b.block_hash) == fa]
+        other = [b for b in blocks if get_group_id(b.block_hash) != fa]
+        for b in reversed(attn):
+            parent = self._parent_key.get(b.block_hash, False)
+            # parent None = recorded first block; False = chain unknown (keep as new)
+            release(b, parent or None, is_root=not parent)
+        for b in reversed(other):
+            release(b, make_block_hash_with_group_id(get_block_hash(b.block_hash), fa), False)
+
+    def _refresh_chain(self, key, covered: set | None = None, force: bool = False) -> None:
+        """gfx1030 fork: move a prefix's RAM copy to MRU, tail first, head last.
+
+        A RAM hit on this model needs the prefix unbroken from its first block,
+        with the Mamba state blocks of its positions. If any block of it is
+        older in the RAM tier's LRU than the rest, it is dropped first and the
+        whole prefix becomes useless. Measured: the blocks at Mamba retention
+        positions reached RAM early (co-copied when the walk met a Mamba block
+        first), were never refreshed, and every 8th block of two 48k prompts
+        vanished under pressure -> 0 % hits. So recency is maintained per
+        prefix: walking parent keys (recorded in _record_chain, independent of
+        the GPU) from ``key`` to the root, every position's blocks of all
+        cacheable groups are moved to MRU in tail-to-head order, so eviction
+        takes tails first. Used whenever blocks are copied, or a block already
+        in RAM leaves the GPU (it was in use: refresh its prefix).
+        """
+        fa = self.fa_gidx
+        if get_group_id(key) != fa:
+            key = make_block_hash_with_group_id(get_block_hash(key), fa)
+        if covered is not None and key in covered:
+            return
+        if not force:
+            last = self._chain_refresh_marks.get(key)
+            if last is not None and self._lazy_steps - last < 64:
+                return
+        self._chain_refresh_marks[key] = self._lazy_steps
+        positions = []
+        k, n = key, 0
+        while k is not None and n < 8192:
+            if covered is not None:
+                if k in covered:
+                    break
+                covered.add(k)
+            positions.append(k)
+            k = self._parent_key.get(k)
+            n += 1
+        q = self.cpu_block_pool.free_block_queue
+        cached = self.cpu_block_pool.cached_block_hash_to_block
+        groups = self._costore_groups or [fa]
+        for k in positions:
+            raw = get_block_hash(k)
+            for g in groups:
+                b = cached.get_one_block(k if g == fa else make_block_hash_with_group_id(raw, g))
+                if b is not None and b.ref_cnt == 0 and not b.is_null:
+                    q.remove(b)
+                    q.append(b)
+                    self._cpu_stamp[b.block_id] = self._lazy_steps
 
     def _prepare_lazy_store_specs(
         self,
@@ -486,29 +843,73 @@ class SimpleCPUOffloadScheduler:
         num_cpu_free = cpu_pool.get_num_free_blocks()
 
         # Validate cursor: stale if block was removed from free queue.
-        if self._cursor is not None and self._cursor.ref_cnt > 0:
+        cursor_reset = self._cursor is not None and self._cursor.ref_cnt > 0
+        if cursor_reset:
             self._cursor = None
+        # gfx1030 fork: measure the window from the head (next to be evicted)
+        # every step. Resuming from the cursor extended the window by
+        # target_free blocks per step, so over a long chunked prefill the walk
+        # ran deep into the queue and stored nearly every block (eager
+        # behaviour); the CPU tier's LRU then dropped the oldest prefixes.
+        # Rewalking costs <= target_free hash lookups per step.
+        self._lazy_steps += 1
+        window = self._target_free
+        if not _LAZY_RESUME_CURSOR:
+            self._cursor = None
+            # Blocks whose store is still in flight are out of the free queue
+            # (touched) and return to its head when done, so they count toward
+            # the window. Otherwise each step walked target_free blocks past
+            # them, and while completions lagged a few steps (e.g. a CPU reload
+            # followed by decode) hundreds of blocks were stored at once,
+            # draining the CPU tier and evicting its older prefixes.
+            window -= sum(
+                len(t.gpu_block_ids) for t in self._store_event_to_blocks.values()
+            )
+            if window <= 0:
+                return [], [], []
 
         gpu_ids: list[int] = []
         block_hashes: list[bytes] = []
         last_visited = self._cursor
+        plan_chain = not _LAZY_RESUME_CURSOR and _LAZY_RESCUE
+        walk_keys: set = set(self._rescue_keys)
 
         for covered, node in enumerate(free_queue.iter_blocks_after(self._cursor)):
-            if covered >= self._target_free or len(gpu_ids) >= num_cpu_free:
+            if covered >= window or len(gpu_ids) >= num_cpu_free:
                 break
 
             last_visited = node
             bhash = node.block_hash
 
-            if (
+            cpu_blk = (
+                cpu_pool.cached_block_hash_to_block.get_one_block(bhash)
+                if bhash is not None and not node.is_null
+                else None
+            )
+            stored = (
                 bhash is not None
                 and not node.is_null
-                and cpu_pool.cached_block_hash_to_block.get_one_block(bhash) is None
-            ):
-                gpu_ids.append(node.block_id)
-                block_hashes.append(bhash)
+                and cpu_blk is None
+                and bhash not in self._maturing_keys
+                and bhash not in walk_keys
+            )
+            if stored:
+                if plan_chain:
+                    for src, key in self._plan_copies(node, bhash, walk_keys):
+                        if len(gpu_ids) >= num_cpu_free:
+                            break
+                        gpu_ids.append(src.block_id)
+                        block_hashes.append(key)
+                else:
+                    gpu_ids.append(node.block_id)
+                    block_hashes.append(bhash)
+            if _offload_debug.ENABLED:
+                _offload_debug.note_walk(node, stored)
 
         self._cursor = last_visited
+        if _offload_debug.ENABLED:
+            _offload_debug.maybe_report(self._target_free, num_cpu_free, cursor_reset,
+                                        self._rescue_stats, self.cpu_block_pool, self.fa_gidx)
 
         # Batch-allocate CPU blocks and stamp hashes.
         if gpu_ids:
@@ -740,8 +1141,27 @@ class SimpleCPUOffloadScheduler:
             self.cpu_block_pool.cached_block_hash_to_block.insert(bhash, cpu_block)
 
         # Free CPU and GPU blocks' ref counts to turn them into prefix cache
-        self.cpu_block_pool.free_blocks(cpu_blocks)
+        if self._lazy_mode and not _LAZY_RESUME_CURSOR and _LAZY_RESCUE:
+            self._place_new_cpu_blocks(cpu_blocks)
+        else:
+            self.cpu_block_pool.free_blocks(cpu_blocks)
         assert self._gpu_block_pool is not None
+        if self._lazy_mode and not _LAZY_RESUME_CURSOR:
+            # gfx1030 fork: the store touched these GPU blocks (out of the free
+            # queue); free_blocks() would append them at the MRU tail, keeping
+            # every offloaded block on the GPU for another full LRU cycle --
+            # the tiers stay inclusive and lazy gains no capacity. They were
+            # next to be evicted and are now safe on CPU: return them to the
+            # head.
+            pool = self._gpu_block_pool
+            to_head = []
+            for bid in gpu_block_ids:
+                blk = pool.blocks[bid]
+                blk.ref_cnt -= 1
+                if blk.ref_cnt == 0 and not blk.is_null:
+                    to_head.append(blk)
+            pool.free_block_queue.prepend_n(to_head)
+            return
         self._gpu_block_pool.free_blocks(
             self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids
         )
@@ -802,6 +1222,7 @@ class SimpleCPUOffloadScheduler:
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
+        self._record_chain(block_ids)
         return self.request_finished(request, block_ids=[])
 
     def _free_pending_cpu_hit(self, pending: tuple) -> None:
@@ -840,6 +1261,9 @@ class SimpleCPUOffloadScheduler:
                 self.cpu_block_pool.blocks[bid]
                 for bid in state.transfer_meta.cpu_block_ids
             )
+            # gfx1030 fork: those were appended at MRU -- used now.
+            for bid in state.transfer_meta.cpu_block_ids:
+                self._cpu_stamp[bid] = self._lazy_steps
             # Free GPU touch refs
             assert self._gpu_block_pool is not None
             self._gpu_block_pool.free_blocks(

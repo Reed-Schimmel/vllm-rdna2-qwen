@@ -37,6 +37,13 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
     # Whether any requests were preempted this step and need flush pending transfers.
     need_flush: bool = False
 
+    # gfx1030 fork, lazy mode: cached GPU blocks the allocator evicted this step
+    # before the lazy walk copied them (plus same-prefix blocks of the other
+    # groups). The worker copies them to CPU at the start of the step, before
+    # the blocks are zeroed and rewritten by their new owner.
+    rescue_gpu_blocks: list[int] = field(default_factory=list)
+    rescue_cpu_blocks: list[int] = field(default_factory=list)
+
 
 @dataclass
 class SimpleCPUOffloadWorkerMetadata(KVConnectorWorkerMetadata):

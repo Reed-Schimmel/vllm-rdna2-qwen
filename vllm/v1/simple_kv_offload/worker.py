@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Worker-side handler for SimpleCPUOffloadConnector."""
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -10,7 +11,15 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
-from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
+from vllm.v1.simple_kv_offload.cuda_mem_ops import (
+    CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
+    BatchMemcpyParams,
+    build_params,
+    copy_blocks,
+    lock_worker_memory,
+    pin_tensor,
+    zeros_thp,
+)
 from vllm.v1.simple_kv_offload.disk_backend import DiskBackend
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
@@ -21,6 +30,8 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
+
+_THP = os.getenv("VLLM_RDNA_OFFLOAD_THP", "1") == "1"
 
 
 class SimpleCPUOffloadWorker:
@@ -206,10 +217,17 @@ class SimpleCPUOffloadWorker:
             # Allocate non-pinned first, then pin via cudaHostRegister to
             # bypass PyTorch's CUDACachingHostAllocator which rounds up to
             # the next power of 2 (e.g. 100 GB -> 128 GB).
-            tensor = torch.zeros(cpu_shape, dtype=gpu_tensor.dtype, device="cpu")
+            if _THP:
+                # gfx1030 fork: huge pages keep compaction from migrating the
+                # registered tier (see zeros_thp / pin_tensor).
+                tensor = zeros_thp(cpu_shape, gpu_tensor.dtype)
+            else:
+                tensor = torch.zeros(cpu_shape, dtype=gpu_tensor.dtype, device="cpu")
             if pin_memory:
                 pin_tensor(tensor)
             self.cpu_kv_caches[name] = tensor
+        if _THP and pin_memory:
+            lock_worker_memory()
 
         self._backend = DmaCopyBackend()
         self._backend.init(
@@ -219,6 +237,32 @@ class SimpleCPUOffloadWorker:
             self.load_stream,
             self.store_stream,
         )
+        self._rescue_caches = (unique_gpu_caches, self.cpu_kv_caches)
+        self._rescue_params: dict[int, BatchMemcpyParams] = {}
+        self._rescue_done: torch.Event | None = None
+
+    def rescue_copy(self, metadata: SimpleCPUOffloadMetadata) -> None:
+        """gfx1030 fork, lazy mode: copy blocks the scheduler evicted this step
+        before they were offloaded (manager._on_gpu_evict). Must run before
+        the model runner zeroes newly allocated blocks (_update_states), so it
+        is called at the top of Worker.execute_model, on the compute stream:
+        ordered after the previous step's forward, before this step's zeroing
+        and forward. Loads of this step wait for it (they may target the same
+        blocks)."""
+        if not metadata.rescue_gpu_blocks:
+            self._rescue_done = None
+            return
+        stream = torch.cuda.current_stream()
+        params = self._rescue_params.get(stream.cuda_stream)
+        if params is None:
+            gpu, cpu = self._rescue_caches
+            params = build_params(gpu, cpu, stream,
+                                  src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_STREAM)
+            self._rescue_params[stream.cuda_stream] = params
+        copy_blocks(metadata.rescue_gpu_blocks, metadata.rescue_cpu_blocks, params)
+        if self._rescue_done is None:
+            self._rescue_done = torch.Event()
+        self._rescue_done.record(stream)
 
     def bind_connector_metadata(self, metadata: SimpleCPUOffloadMetadata) -> None:
         self._connector_metadata = metadata
@@ -245,6 +289,7 @@ class SimpleCPUOffloadWorker:
                 is_store=False,
                 event_idx=metadata.load_event,
                 events_list=self._load_events,
+                wait_event=getattr(self, "_rescue_done", None),
             )
 
     def wait_for_save(self) -> None:

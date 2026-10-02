@@ -1634,3 +1634,27 @@ from vllm.v1.simple_kv_offload import timing as _offload_timing  # noqa: E402
 
 if _offload_timing.ENABLED:
     Worker.execute_model = _offload_timing.wrap_execute_model(Worker.execute_model)
+
+
+# gfx1030 fork: lazy CPU offload eviction rescue -- copy blocks the scheduler
+# evicted uncopied before _update_states zeroes them (simple_kv_offload/manager.py
+# _on_gpu_evict, worker.py rescue_copy).
+def _wrap_offload_rescue(fn):
+    def wrapper(self, scheduler_output, *a, **kw):
+        meta = getattr(scheduler_output, "kv_connector_metadata", None)
+        if meta is not None and getattr(meta, "rescue_gpu_blocks", None) is not None:
+            from vllm.distributed.kv_transfer import (
+                get_kv_transfer_group,
+                has_kv_transfer_group,
+            )
+
+            if has_kv_transfer_group():
+                handler = getattr(get_kv_transfer_group(), "worker_handler", None)
+                if handler is not None and hasattr(handler, "rescue_copy"):
+                    handler.rescue_copy(meta)
+        return fn(self, scheduler_output, *a, **kw)
+
+    return wrapper
+
+
+Worker.execute_model = _wrap_offload_rescue(Worker.execute_model)
