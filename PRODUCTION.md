@@ -3,6 +3,10 @@
 How this fork runs in production on four Radeon PRO V620s (tensor parallel, TP=4) serving
 Qwen3.8-Flash-Next, and the balance of performance, stability and power cost behind that setup.
 
+**Setting up or rebuilding a host? Start at [`hwconfig/`](hwconfig/README.md).** It lists every piece of host
+configuration (kernel patches, command line, per-boot GPU settings, OS settings) with where each is made
+persistent, and [`hwconfig/check-host.sh`](hwconfig/check-host.sh) checks a running host against it.
+
 ## Performance vs. stability
 
 Most of this fork's work went into speed: kernels written for gfx1030, int8 and int4 compute paths, a

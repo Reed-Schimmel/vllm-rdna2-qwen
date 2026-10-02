@@ -26,7 +26,7 @@ Threadripper). If it's useful to you, great. If it's not, you can have a refund 
 | Run it in Docker | [Container image](#container-image) below |
 | See how we run it day to day (GPU power, clocks, settings, kernel line) | [`PRODUCTION.md`](PRODUCTION.md) |
 | Look up an environment variable | [`docs/rdna2/ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md) |
-| Set up the host (amdgpu patches, power/clock script) | [`hwconfig/`](hwconfig/) |
+| Set up or rebuild the host (amdgpu patches, kernel line, power/clock script, OS settings, `check-host.sh`) | [`hwconfig/`](hwconfig/) |
 | Fix something that broke | [Troubleshooting](#troubleshooting) below |
 | Understand what was changed and why | [Understanding the work](#understanding-the-work) below |
 
@@ -216,7 +216,7 @@ shows everything against upstream vLLM. `main` tracks upstream vLLM; this fork's
 | [`docs/rdna2/PROFILE-NAVI21.md`](docs/rdna2/PROFILE-NAVI21.md) | The silicon profile the kernels were designed against |
 | [`docs/rdna2/ENVIRONMENT.md`](docs/rdna2/ENVIRONMENT.md) | Every environment variable |
 | [`PRODUCTION.md`](PRODUCTION.md) | The production configuration and the performance/stability/power balance behind it |
-| [`hwconfig/`](hwconfig/) | amdgpu kernel patches and the GPU power/clock setup script |
+| [`hwconfig/`](hwconfig/) | Host configuration checklist: amdgpu kernel patches, GPU power/clock setup, OS settings (sysctl, memlock), `check-host.sh` |
 | [`docs/rdna2/README.md`](docs/rdna2/README.md) | The detailed install guide behind the quick start |
 | [`tools/rdna2/`](tools/rdna2/) | Build, serve, benchmark, profile and test tools |
 

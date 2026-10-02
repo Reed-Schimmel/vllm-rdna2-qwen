@@ -192,6 +192,19 @@ if [ -n "${PROFILE:-}" ]; then
   PROF=(--profiler-config.profiler=torch --profiler-config.torch_profiler_dir="$TRACES")
 fi
 
+# CPU KV-cache tier: host preconditions (hwconfig/os/README.md). Warn loudly rather than fail: serving works
+# without them, but compaction can then stall a rank for 5-20 s (CHANGES.md #19b).
+if [[ " ${EXTRA_ARGS:-} " == *" --kv-offloading-size "* ]]; then
+  _cua=$(cat /proc/sys/vm/compact_unevictable_allowed 2>/dev/null || echo '?')
+  _ml=$(ulimit -l)
+  if [ "$_cua" != 0 ] || [ "$_ml" != unlimited ]; then
+    echo "WARNING: --kv-offloading-size without its host settings (see hwconfig/os/README.md):" >&2
+    [ "$_cua" != 0 ] && echo "  vm.compact_unevictable_allowed = $_cua (need 0: install hwconfig/os/etc/sysctl.d/90-vllm-offload.conf)" >&2
+    [ "$_ml" != unlimited ] && echo "  locked-memory limit $_ml KiB (need unlimited: hwconfig/os/ systemd drop-ins, or ulimit -l unlimited)" >&2
+    echo "  Expect occasional multi-second stalls on all ranks. Check everything with hwconfig/check-host.sh." >&2
+  fi
+fi
+
 CMD=(python3 -m vllm.entrypoints.openai.api_server
   --model "$MODEL" --served-model-name qwen38-flash-next
   --dtype float16

@@ -45,7 +45,10 @@ docker run -d --name qwen38 --network=host \
   container the GPUs (group ids differ per distro, hence `getent`); `--ipc=host` and
   `--ulimit memlock=-1` are required — the n-gram worker and the four GPU workers share pinned
   host buffers; `--security-opt seccomp=unconfined` lets ROCm's memory mapping work;
-  `--network=host` exposes port 8000 directly (the only mode we test).
+  `--network=host` exposes port 8000 directly (the only mode we test). With the CPU KV-cache tier
+  (`--kv-offloading-size`), `--ulimit memlock=-1` also lets the workers lock the tier, and the *host* needs
+  `vm.compact_unevictable_allowed = 0` (a container cannot set it): see
+  [`../hwconfig/os/README.md`](../hwconfig/os/README.md).
 - `ROCR_VISIBLE_DEVICES` — your four serving cards, in `rocm-smi` order.
 - `/models` must hold `qwen38-flash-next/` and `qwen38-flash-next-ple/ples_int4/` (override with
   `-e MODEL=… -e PLE_INT4=…`). Weights are never shipped in the image.
