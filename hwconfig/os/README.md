@@ -63,12 +63,13 @@ memory is compacted as before. Locked memory is also never reclaimed: keep the h
 (tier + n-gram table + workers, with a margin in `MemAvailable`).
 
 **Not needed: `vm.compaction_proactiveness`.** Setting it to 0 turns off background defragmentation. It was the
-largest source of page moves before the memory was locked; with both parts above in place it should no
-longer reach the vLLM workers. Leave it at the default (20) unless the eviction counters above grow while
+largest source of page moves before the memory was locked; with both parts above in place it no longer
+reaches the vLLM workers (measured, below). Leave it at the default (20) unless the eviction counters above grow while
 serving, or another ROCm *compute* process (HIP; Vulkan programs are not affected) shows queue evictions.
 
 **Measured** (4× V620, 48 GiB tier, 2026-10-01/02): ~120 s of queue eviction per worker over one test run and
 13–19 s steps with neither part; with both parts (and `compaction_proactiveness` at 0 during that test), ~25 ms
 over a soak plus a 10 GB memory-pressure test. The combination recommended here, with `compaction_proactiveness`
-at its default, has not yet been soaked: watch the counters after deploying it. Details in
+at its default (20), passed a live check the same day: 240 s soak plus decode under 10 GB memory pressure, the
+kernel migrated ~1.9M pages and the workers' queue-eviction counters did not move from their startup values. Details in
 [`../../docs/rdna2/CHANGES.md`](../../docs/rdna2/CHANGES.md) §19b.
