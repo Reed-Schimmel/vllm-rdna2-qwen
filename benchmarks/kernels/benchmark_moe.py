@@ -361,7 +361,9 @@ def get_rocm_tuning_space(use_fp16):
     return param_ranges
 
 
-def get_configs_compute_bound(use_fp16, block_quant_shape) -> list[dict[str, int]]:
+def get_configs_compute_bound(
+    use_fp16, block_quant_shape, use_int4_w4a16=False
+) -> list[dict[str, int]]:
     configs: list[BenchmarkConfig] = []
 
     if current_platform.is_rocm():
@@ -401,23 +403,53 @@ def get_configs_compute_bound(use_fp16, block_quant_shape) -> list[dict[str, int
         block_n, block_k = block_quant_shape[0], block_quant_shape[1]
         for config in configs[:]:
             bn, bk = config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"]
-            n_aligned = bn % block_n == 0 or block_n % bn == 0
-            k_aligned = bk % block_k == 0 or block_k % bk == 0
+            n_aligned = block_n == 0 or bn % block_n == 0 or block_n % bn == 0
+            k_aligned = block_k == 0 or bk % block_k == 0 or block_k % bk == 0
             if not (n_aligned and k_aligned):
                 configs.remove(config)
+    # int4_w4a16 moe_wna16_gemm requires BLOCK_SIZE_K to be a multiple of the
+    # quant group_size (block_quant_shape[1]); the fp8 "either divides" rule is
+    # too permissive here and yields kernels that abort at launch.
+    if use_int4_w4a16 and block_quant_shape is not None:
+        group_k = block_quant_shape[1]
+        configs = [
+            c
+            for c in configs
+            # BLOCK_SIZE_K % group_size == 0 and BLOCK_SIZE_K // group_size in
+            # {1,2,4,8}; BLOCK_SIZE_M <= 64 (moe_wna16.cu:343-348)
+            if c["BLOCK_SIZE_K"] % group_k == 0
+            and (c["BLOCK_SIZE_K"] // group_k) in (1, 2, 4, 8)
+            and c["BLOCK_SIZE_M"] <= 64
+        ]
     return configs
 
 
 def prune_rocm_search_space(
-    num_tokens, shard_intermediate_size, hidden_size, search_space, is_fp16, topk
+    num_tokens,
+    shard_intermediate_size,
+    hidden_size,
+    search_space,
+    is_fp16,
+    topk,
+    use_int4_w4a16=False,
 ):
     N1, K1 = shard_intermediate_size, hidden_size
     N2, K2 = hidden_size, shard_intermediate_size // 2
+    # int4_w4a16 moe_wna16_gemm needs K divisible by BLOCK_SIZE_K for BOTH
+    # GEMMs. prune_rocm_configs runs per GEMM and the results are unioned
+    # below, so a tile valid for K1 but not K2 would survive; drop such tiles
+    # up front against both reduction dims.
+    if use_int4_w4a16:
+        search_space = [
+            c
+            for c in search_space
+            if K1 % c["BLOCK_SIZE_K"] == 0 and K2 % c["BLOCK_SIZE_K"] == 0
+        ]
     pruned_space_1 = prune_rocm_configs(
-        num_tokens * topk, N1, K1, search_space, is_fp16
+        num_tokens * topk, N1, K1, search_space, is_fp16, use_int4_w4a16
     )
     pruned_space_2 = prune_rocm_configs(
-        num_tokens * topk, N2, K2, search_space, is_fp16
+        num_tokens * topk, N2, K2, search_space, is_fp16, use_int4_w4a16
     )
     search_space = merge_unique_dicts(pruned_space_1, pruned_space_2)
     return search_space
@@ -425,7 +457,7 @@ def prune_rocm_search_space(
 
 # The following code is inspired by ROCm/Triton GEMM tuning script:
 # https://github.com/ROCm/triton/blob/triton-mlir/scripts/amd/gemm/tune_gemm.py#L89
-def prune_rocm_configs(M, N, K, configs, is_fp16=True):
+def prune_rocm_configs(M, N, K, configs, is_fp16=True, use_int4_w4a16=False):
     pruned_configs = []
     elemBytes_a = 2 if is_fp16 else 1
     elemBytes_b = 2 if is_fp16 else 1
@@ -448,6 +480,11 @@ def prune_rocm_configs(M, N, K, configs, is_fp16=True):
             if matrix_instr_nonkdim > mfma:
                 continue
         if mfma == 4 and BLOCK_SIZE_K < 64:
+            continue
+        # int4_w4a16 moe_wna16_gemm requires the reduction dim K to be an exact
+        # multiple of BLOCK_SIZE_K (no K padding for the packed weights), so
+        # drop tiles that do not divide this GEMM's K.
+        if use_int4_w4a16 and K % BLOCK_SIZE_K != 0:
             continue
         # some layouts could not work properly in case
         # number elements per thread is less 1
@@ -618,6 +655,7 @@ class BenchmarkWorker:
                 search_space,
                 is_fp16,
                 topk,
+                use_int4_w4a16,
             )
 
         need_device_guard = False
@@ -952,16 +990,21 @@ def main(args: argparse.Namespace):
     use_deep_gemm = bool(args.use_deep_gemm)
 
     if current_platform.is_rocm() and "HIP_VISIBLE_DEVICES" in os.environ:
-        # Ray will set ROCR_VISIBLE_DEVICES for device visibility
-        logger.warning(
-            "Ray uses ROCR_VISIBLE_DEVICES to control device accessibility."
-            "Replacing HIP_VISIBLE_DEVICES with ROCR_VISIBLE_DEVICES."
-        )
-        val = os.environ["HIP_VISIBLE_DEVICES"]
-        os.environ["ROCR_VISIBLE_DEVICES"] = val
-        del os.environ["HIP_VISIBLE_DEVICES"]
+        # Newer Ray (>=2.5x) enumerates AMD GPUs via HIP_VISIBLE_DEVICES and
+        # rejects ROCR_VISIBLE_DEVICES. Older Ray wanted ROCR. Try the modern
+        # path first (leave HIP as-is); fall back to the ROCR swap only if
+        # ray.init fails.
+        os.environ.pop("ROCR_VISIBLE_DEVICES", None)
 
-    ray.init()
+    try:
+        ray.init()
+    except RuntimeError:
+        if current_platform.is_rocm() and "HIP_VISIBLE_DEVICES" in os.environ:
+            val = os.environ.pop("HIP_VISIBLE_DEVICES")
+            os.environ["ROCR_VISIBLE_DEVICES"] = val
+            ray.init()
+        else:
+            raise
     num_gpus = int(ray.available_resources()["GPU"])
     workers = [BenchmarkWorker.remote(args.seed) for _ in range(num_gpus)]
 
@@ -980,12 +1023,14 @@ def main(args: argparse.Namespace):
         # int4_w4a16 weights are uint8-packed, not fp16; treat like fp8 for
         # search space generation (no matrix_instr_nonkdim/kpack exploration).
         is_fp16 = not (use_fp8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
-        # For int4_w4a16, the group_size constraint on BLOCK_SIZE_K does not
-        # apply: the gptq_awq kernel handles arbitrary BLOCK_SIZE_K regardless
-        # of group_size. Skip block_quant_shape filtering to keep the full
-        # search space (e.g. BLOCK_SIZE_K=64 with group_size=128).
-        tune_block_quant_shape = None if use_int4_w4a16 else block_quant_shape
-        search_space = get_configs_compute_bound(is_fp16, tune_block_quant_shape)
+        # For int4_w4a16 on ROCm, the moe_wna16_gemm kernel requires
+        # BLOCK_SIZE_K to be a multiple of the quant group_size, so keep the
+        # block_quant_shape and let get_configs_compute_bound filter to valid
+        # BLOCK_SIZE_K (e.g. drop 16/32/64 when group_size=128).
+        tune_block_quant_shape = block_quant_shape
+        search_space = get_configs_compute_bound(
+            is_fp16, tune_block_quant_shape, use_int4_w4a16=use_int4_w4a16
+        )
         if use_int4_w4a16:
             # SPLIT_K is a required kernel constexpr for gptq_awq kernel;
             # only SPLIT_K=1 is used at runtime, so fix it during tuning.
