@@ -1,0 +1,38 @@
+[Unit]
+Description=Qwen3.8-Flash-Next vLLM server (4x Radeon PRO V620 / gfx1030)
+Documentation=file:///home/ai/vLLM/vllm-rdna2-qwen/docs/rdna2/README.md
+# Wait for the GPUs and network to be present before starting.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ai
+Group=ai
+# The amdgpu device nodes require the render/video groups.
+SupplementaryGroups=render video
+
+WorkingDirectory=/home/ai/vLLM/vllm-rdna2-qwen
+ExecStart=/home/ai/vLLM/vllm-rdna2-qwen/tools/rdna2/start-qwen38-service.sh
+
+# Boot is long (weights + torch.compile + CUDA-graph capture + PLE sidecar prefault):
+# give it up to 30 min before systemd considers the start a failure, and use a
+# health check as the readiness signal.
+TimeoutStartSec=1800
+# Send SIGINT (like Ctrl-C) so vLLM shuts its worker processes down cleanly.
+KillSignal=SIGINT
+TimeoutStopSec=120
+
+# Restart on crash, but back off so a boot-loop does not thrash the cards.
+Restart=on-failure
+RestartSec=15
+
+# Locked memory for the PLE sidecar / P2P buffers (matches the container --ulimit memlock=-1).
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+
+# Optional hardening that is safe for this workload.
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target
