@@ -8,6 +8,9 @@
 #     tools/rdna2/serve-qwen38-flash-next.sh
 #
 # Knobs (env): GPUS (ROCR device ids, default 1,2,3,4), PORT (8000), MTP (3), GPUUTIL (0.90),
+#   MAX_SEQS (4; --max-num-seqs. The fork's decode kernels cover batches <= 8 tokens, so keep
+#   MAX_SEQS * (1 + MTP) <= 8), KV_CACHE_DTYPE (auto; 16-bit only, see below),
+#   VISION_CPU_OFFLOAD (0; GiB/card for the vision tower in pinned CPU RAM, needs VISION=1),
 #   DENSE_INT8 (1), DENSE_INT8_ONLY (0; 1 = release the fp16 copies of the shadowed projections,
 #   ~3 GiB/card -> KV; own VLLM_CACHE_ROOT + GPUUTIL <= 0.93, see CHANGES.md #7), EAGER (unset),
 #   PROFILE (unset), TRACES (dir for torch-profiler traces),
@@ -49,6 +52,11 @@ PORT="${PORT:-8000}"
 MTP="${MTP:-3}"
 GPUUTIL="${GPUUTIL:-0.90}"
 MAXLEN="${MAXLEN:-131072}"
+# KV cache dtype. The int8 features (DENSE_INT8*, W8A8, W4A8, AR_Q8) quantise weights and
+# prefill activations, never the KV cache. The current sparse-attention implementation
+# (qsa.py) accepts auto or bfloat16, rejecting explicit float16 and fp8. Use auto
+# with --dtype float16 (the default here).
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
 TRACES="${TRACES:-$PWD/logs/traces}"
 mkdir -p "$TRACES"
 
@@ -176,10 +184,19 @@ if [ "${VISION:-0}" = "1" ]; then
   VISIONARGS=(--limit-mm-per-prompt "${MM_LIMIT:-$_MM_LIMIT_DEFAULT}"
               --mm-processor-kwargs "${MM_PROCESSOR_KWARGS:-$_MM_PROC_DEFAULT}")
   export MM_ELIDE_OVER_LIMIT="${MM_ELIDE:-1}"
+  # Optionally offload the vision tower's weights (~0.9 GB/card) to pinned CPU RAM, accessed
+  # over PCIe via UVA (zero-copy). The model's _mark_tower_model routes the "visual" tower
+  # through the UVA offloader (supports_tower_offload=True), so the tower weights are never
+  # allocated on the GPU -- freeing that VRAM for the KV pool. Costs PCIe bandwidth on every
+  # image forward (prefill only; text decode is unaffected). VISION_CPU_OFFLOAD is the GiB/card
+  # budget (must exceed the tower size; 2 is ample). 0 (default) keeps the tower on the GPU.
+  if [ "${VISION_CPU_OFFLOAD:-0}" != "0" ]; then
+    VISIONARGS+=(--cpu-offload-gb "$VISION_CPU_OFFLOAD" --cpu-offload-params visual)
+  fi
 fi
 PROF=()
 # CUDA-graph capture sizes (2026-09-06). vLLM caps the default piecewise list at
-# min(max_num_seqs * 2, 512) tokens -- with --max-num-seqs 4 that is 8, so every real prefill batch
+# min(max_num_seqs * 2, 512) tokens -- with --max-num-seqs 4 (MAX_SEQS default) that is 8, so every real prefill batch
 # ran its compiled pieces eagerly (~3,500 launches for a 40-word prompt). Capturing up to 256 tokens
 # takes short-prompt TTFT from 0.38-0.42 s to 0.25 s (-35%); decode and long prefill unchanged.
 # Cost: graph memory 0.64 -> 1.31 GiB per card (KV pool 353k -> 309k tokens). Larger lists cost
@@ -187,7 +204,9 @@ PROF=()
 # cached-prefix turn is bounded by the partial-block recompute, not by launches.
 # CG_SIZES= (empty) restores vLLM's default list.
 CG_SIZES="${CG_SIZES-1 2 4 8 16 32 64 128 256}"
-CGARGS=(); [ -n "$CG_SIZES" ] && CGARGS=(--cudagraph-capture-sizes $CG_SIZES)
+CGARGS=()
+# shellcheck disable=SC2206 # CG_SIZES is a whitespace-separated list of integers.
+[ -n "$CG_SIZES" ] && CGARGS=(--cudagraph-capture-sizes $CG_SIZES)
 if [ -n "${PROFILE:-}" ]; then
   PROF=(--profiler-config.profiler=torch --profiler-config.torch_profiler_dir="$TRACES")
 fi
@@ -205,12 +224,14 @@ if [[ " ${EXTRA_ARGS:-} " == *" --kv-offloading-size "* ]]; then
   fi
 fi
 
+# shellcheck disable=SC2206 # EXTRA_ARGS intentionally supplies whitespace-separated arguments.
 CMD=(python3 -m vllm.entrypoints.openai.api_server
   --model "$MODEL" --served-model-name qwen38-flash-next
   --dtype float16
+  --kv-cache-dtype "$KV_CACHE_DTYPE"
   --tensor-parallel-size 4 --enable-expert-parallel
   --max-model-len "$MAXLEN" --gpu-memory-utilization "$GPUUTIL"
-  --max-num-seqs 4 --max-num-batched-tokens 2048
+  --max-num-seqs "${MAX_SEQS:-4}" --max-num-batched-tokens 2048
   ${EAGER:+--enforce-eager}
   "${VISIONARGS[@]}"
   --enable-prefix-caching
