@@ -22,7 +22,7 @@ either keep `COMPILE_CACHE_OFF=1` (the serve script's default) or clear the comp
 ## 1. Launcher knobs (serve script)
 
 | Variable | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `MODEL` | required | Directory of the AWQ-W4A16 backbone (checkpoint shards 2–5 plus `model_mtp.safetensors`). |
 | `PLE_INT4` | required unless `PLE_DISK_DIR` | Directory of the quantised n-gram table sidecar (int4 or fp8, 128 shards + `META.json`). Exported as `VLLM_PLE_QUANT_DIR`. |
 | `PLE_DISK_DIR` | unset | Alternative to `PLE_INT4`: a writable directory for the unquantised bf16 n-gram table (~95 GiB). The first boot copies the table out of checkpoint shard 1; later boots memory-map the file. Exported as `VLLM_PLE_DISK_OFFLOAD_DIR`. |
@@ -31,6 +31,8 @@ either keep `COMPILE_CACHE_OFF=1` (the serve script's default) or clear the comp
 | `MTP` | `3` | Speculative tokens from the model's multi-token-prediction head. `0` disables speculation. |
 | `GPUUTIL` | `0.90` | `--gpu-memory-utilization`: the fraction of each card's VRAM vLLM may use. KV cache fills whatever the model and activations leave. With `DENSE_INT8_ONLY=1`, stay at 0.93 or below. |
 | `MAXLEN` | `131072` | `--max-model-len`. The model supports 262,144. |
+| `MAX_SEQS` | `4` | `--max-num-seqs`. Skinny decode kernels cover up to 16 tokens per step; fused glue covers up to 8 and graph-padded 16. MTP adds tokens per sequence. The host service wrapper defaults to 8 sequences with MTP off. |
+| `KV_CACHE_DTYPE` | `auto` | `--kv-cache-dtype`. QSA accepts `auto`, `bfloat16`, or `int8_per_token_head`; explicit `float16` and fp8 are rejected. `auto` uses the model dtype (`float16` in this launcher). INT8 KV is independent of weight/activation quantization. |
 | `DENSE_INT8` | `1` | Sets `VLLM_RDNA_DENSE_INT8` (§3 below). |
 | `DENSE_INT8_ONLY` | `0` | Sets `VLLM_RDNA_DENSE_INT8_ONLY` (§3). Changes the compiled graph: use a separate `VLLM_CACHE_ROOT`. |
 | `COMPILE_CACHE_OFF` | `1` | Sets `VLLM_DISABLE_COMPILE_CACHE`. `0` saves ~700 s per boot, but see the note above. |
@@ -38,12 +40,14 @@ either keep `COMPILE_CACHE_OFF=1` (the serve script's default) or clear the comp
 | `CG_SIZES` | `1 2 4 8 16 32 64 128 256` | Batch sizes captured as CUDA graphs. Covers decode and short prefills; empty = vLLM's default list. |
 | `EAGER` | unset | Any value: `--enforce-eager` (no CUDA graphs). For debugging only; much slower decode. |
 | `PROFILE` | unset | Any value: enable the torch profiler, writing traces to `TRACES`. |
+| `VLLM_SERVE_PREFIX` | unset | Whitespace-separated command prefix for profiling, e.g. `rocprofv3 --kernel-trace --`. Unset launches the server directly; shell quoting inside the value is not interpreted. |
 | `TRACES` | `./logs/traces` | Output directory for profiler traces. |
 | `TOOLS` | unset | `1`: OpenAI tool calling with `tool_choice: auto`, for agentic clients. |
 | `TOOL_PARSER` | `qwen3_coder` | Tool-call parser: the model emits Qwen3-Coder-style `<function=…>` XML. |
 | `REASONING_PARSER` | `qwen3` | Moves `<think>` blocks into `reasoning_content`. |
 | `CHAT_KWARGS` | unset | JSON merged into every request's `chat_template_kwargs`; request values win. The template understands `enable_thinking`, `preserve_thinking` and `reasoning_effort` (`xhigh`, `medium`, `low`). |
 | `VISION` | `0` | `1`: load the vision tower and accept images on the chat API. The tower is replicated on every rank, ~0.9 GB less KV per card. |
+| `VISION_CPU_OFFLOAD` | `0` | With `VISION=1`, offload the `visual` tower weights to pinned CPU RAM via UVA. Value is the GiB/card budget (`2` covers the tower); trades image-prefill PCIe traffic for GPU KV capacity. Ignored when vision is disabled. The host service wrapper defaults to `2`. |
 | `MM_LIMIT` | `{"image": 4, "video": 0}` | `--limit-mm-per-prompt`. |
 | `MM_PROCESSOR_KWARGS` | `{"max_pixels": 1638400}` | Images are resized to at most ~1280×1280 before the encoder. The vision attention on gfx1030 materialises N² memory, so large images must be bounded. |
 | `MM_ELIDE` | `1` | When a conversation holds more images than `MM_LIMIT`, replace the oldest with a text marker instead of failing the request with HTTP 400. |
@@ -62,7 +66,7 @@ path, and everything else to RCCL.
 ### One-shot all-reduce for small messages (§6, §15, §18)
 
 | Variable | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `VLLM_RDNA_AR` | `1` | Use the fork's one-shot all-reduce for messages up to `VLLM_RDNA_AR_MAX_KB`. `0` sends everything to RCCL: always works, about 26 % slower single-stream decode. |
 | `VLLM_RDNA_AR_MODE` | `p2p` (serve script: `wide`) | How the one-shot kernel moves data. See below. The serve script defaults to `wide` (since 2026-09-27). |
 | `VLLM_RDNA_AR_MAX_KB` | `64` | Largest message (KB) taken by the one-shot kernel. Decode messages (batch × 2560 fp16) fit; larger ones go to RCCL, which is faster there. |
@@ -87,7 +91,7 @@ path, and everything else to RCCL.
 ### int8-compressed prefill all-reduce (§14, §17)
 
 | Variable | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `VLLM_RDNA_AR_Q8` | `0` | `1`: large prefill all-reduces are sent as int8 with an fp16 scale per group, roughly halving the bytes on the bus. Two-shot: exchange shards, sum in fp32 and requantise, all-gather. Relative error ~0.8 % vs fp16. Prefill +2–5 % alone, +7–9 % together with `VLLM_RDNA_DENSE_W8A8`. |
 | `VLLM_RDNA_AR_Q8_STAGGER` | `1` | Exchange shards in rounds: in round k each card sends to rank+k and receives from rank−k, so each card has one inbound and one outbound transfer at a time. Bit-identical to the grouped exchange (`0`, all cards to all cards at once) and slightly faster. |
 | `VLLM_RDNA_AR_Q8_MIN_KB` | `1024` | Smallest message (KB) that takes the int8 path. |
@@ -105,7 +109,7 @@ The routed experts are int4. The remaining large layers (linear-attention and sp
 projections, router, shared expert, hyper-connection mixers, output head) ship in fp16.
 
 | Variable | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `VLLM_RDNA_DENSE_INT8` | `0` (serve script: `1`) | Keep an int8 weight-only copy of each fp16 projection, with one symmetric scale per output channel, and use it for decode-sized calls (≤ 8 tokens). This halves the bytes streamed per decode step. Prefill keeps using fp16. |
 | `VLLM_RDNA_DENSE_INT8_MIN_ROWS` | `64` | Skip layers with fewer output rows than this. |
 | `VLLM_RDNA_DENSE_INT8_ONLY` | `0` | Also **free the fp16 weight** once its int8 copy exists, so int8 is the only resident copy: about 2–3 GB per card back to the KV cache. Prefill then dequantises the int8 weight on the fly for each GEMM (~0.3 % of a 2048-token chunk). Quality stays within noise of fp16. |
@@ -121,7 +125,7 @@ projections, router, shared expert, hyper-connection mixers, output head) ship i
 ## 4. MoE experts
 
 | Variable | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `VLLM_RDNA_MOE_W4A8` | `0` | Prefill MoE kernel with int8 activations × int4 experts, using the chip's packed int8 dot-product instructions (`v_dot4`). About 2× on the MoE GEMMs, +27 % prefill. |
 | `VLLM_RDNA_MOE_W4A8_MIN_TOKENS` | `64` | Smallest batch (tokens) that takes the W4A8 kernel. Decode keeps the int4 GEMV below. |
 | `VLLM_RDNA_MOE_W4A8_BN` / `_BK` / `_WARPS` / `_STAGES` | `128` / `16` / `8` / `2` | Kernel tile. Larger K blocks spill registers on this chip and lose up to 5×. |
@@ -132,18 +136,39 @@ projections, router, shared expert, hyper-connection mixers, output head) ship i
 ## 5. Fused decode kernels (§8)
 
 | Variable | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `VLLM_RDNA_FUSED_HC` | `1` | The hyper-connection mix (the model's four residual branches) runs as one fused kernel in decode instead of several small ones. |
 | `VLLM_RDNA_FUSED_SE` | `1` | The shared-expert MLP runs as one fused decode kernel. |
+| `VLLM_RDNA_MOE_V2` | `1` | The routed-expert decode kernels (batches up to 16) use the v2 pair: 16-byte weight loads, no shared-memory staging, only the experts held on this rank do work. `0` restores v1. |
+| `VLLM_RDNA_MOE_V3` | `1` | At decode batches of 1–2, the shared expert is computed inside the routed-expert kernel pair instead of as its own launches. Larger batches use v2 + the separate shared expert, which is as fast there. |
 
-Both cut the number of kernel launches per decode step, which was a major cost on this chip.
+All of these cut kernel launches or wasted work per decode step; launch overhead was a major cost on this chip.
+
+**int8 KV cache (`--kv-cache-dtype int8_per_token_head`).** The 12 full-attention (QSA) layers can keep their main
+K/V cache as int8 with one fp32 scale per token and head (absmax/127). This about doubles the KV-cache token
+capacity at unchanged decode and prefill speed: on 4 × V620 at `GPUUTIL=0.93`, 482k → 939k tokens. Needle retrieval
+at 32k/64k was unchanged (10/10), and greedy output stays within near-tie noise of the fp16 cache. The QSA indexer
+caches stay fp16; they are about 3 % of the per-token bytes. gfx1030 has no fp8 hardware, so use int8 rather than
+the fp8 cache types. Changing the flag changes the compile cache key, so expect one cold boot.
+
+**Turn-boundary prefix hits (`--prefix-match-unit 16`).** Recommended for chat and agent use. Prefix-cache keys
+are then computed every 16 tokens instead of every 784-token block. Together with the scheduler tail stop above,
+each prompt saves its linear-attention state just before its generation prompt. A follow-up turn then
+recomputes only its new message plus a few template tokens: about 50–90 tokens. Before, it was up to one
+block, ≤ 783 tokens, or ≤ 1567 with int8 KV. On 4 × V620 that took follow-up TTFT from 0.3–1.5 s to 0.4–0.6 s,
+with no decode cost. The value must divide 784 and be a multiple of 4, the QSA indexer's compression ratio;
+it does not change the compile key. Trade-off without fine-grained prefix matching: the hybrid model's shared
+block size is set so an attention page holds at least one Mamba state, so halving the bytes per token doubles
+the block (784 → 1568 tokens). Block-level prefix-cache hits are then 2× coarser, and up to ~1.5k tokens of a
+cached conversation are recomputed per turn instead of ~0.8k. `--prefix-match-unit 16` and the tail stop mitigate
+that recomputation; validate them with the deployment's chat template and CPU KV tier before enabling.
 
 ---
 
 ## 6. Sparse attention (QSA indexer) (§8d, §11, §16)
 
 | Variable | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `VLLM_RDNA_QSA_BOUND_MIN_TOKENS` | `512` | For eager prefill batches of at least this many tokens, the indexer scores only the compressed keys that can actually be visible, not the page table's full capacity. Smaller and graph-captured batches keep full capacity, so a captured graph never bakes in a column count. |
 | `VLLM_RDNA_QSA_DOT` | `0` | `1`: use the blocked `tl.dot` scoring kernel (roughly parity). Tile: `VLLM_RDNA_QSA_DOT_BLOCK_M` / `_BLOCK_N` / `_WARPS` / `_STAGES` (16 / 32 / 8 / 1). |
 | `VLLM_RDNA_QSA_MQA_BLOCK_N` / `_MQA_WARPS` / `_MQA_STAGES` | `128` / `8` / Triton default | Tile of the indexer's scoring kernel. |
@@ -158,15 +183,18 @@ Any `VLLM_RDNA_QSA_*` override is logged as a warning at startup.
 ## 7. Scheduler (§12)
 
 | Variable | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `VLLM_RDNA_MAMBA_RETENTION_STOPS` | `1` | End prefill steps exactly at the ends of the linear-attention state blocks (784 tokens) that the prefix cache retains. The saved state is only exact when a step ends on a block boundary. Without this, a follow-up turn on a long conversation could re-prefill tens of thousands of tokens (e.g. 31 s instead of seconds to first token). |
+| `VLLM_RDNA_MAMBA_TAIL_STOP` | `1` | With `--prefix-match-unit`, also end a prefill step at the prompt's last match boundary. The partial-tail state saved there is what lets a follow-up turn resume within a few tokens of the previous prompt's end, instead of at its last full 784-token block. Without `--prefix-match-unit` it does nothing. |
+| `VLLM_RDNA_PROMPT_TAIL_BACKOFF` | `4` | How many tokens before the prompt end the partial-tail state is placed. A chat follow-up re-renders the previous generation prompt (Qwen's empty think block is 4 tokens), so a state saved at the very end would sit past where the next prompt diverges. `0` restores upstream. |
+| `ALLOW_TRITON_DRIFT` | `0` | The serve script refuses to start unless the installed Triton is the pinned gfx1030 build in `tools/rdna2/constraints-gfx1030.txt`. Upstream Triton dropped RDNA2 targets on 2026-09-30, so a newer Triton changes how every custom kernel is compiled. Set `1` only for deliberate Triton experiments. |
 
 ---
 
 ## 7b. CPU KV-cache offload (§19)
 
 | Setting | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--kv-offloading-size N` (vLLM argument, e.g. via `EXTRA_ARGS`) | off | Keep N GiB (total across all TP ranks) of pinned CPU RAM as a second KV-cache tier. Prefixes evicted from the GPU reload from RAM instead of being recomputed. |
 | `VLLM_USE_SIMPLE_KV_OFFLOAD` | `0` | **Set to `1` with this model.** Selects `SimpleCPUOffloadConnector`, which reuses vLLM's prefix-cache logic for every cache group. The default `OffloadingConnector` refuses to start on the QSA compressor ring (`tokens_per_block=4 not divisible by tokens_per_hash=784`). |
 | `VLLM_RDNA_OFFLOAD_TIMING` | `0` | Diagnostic: log each offload copy's duration, and every worker step slower than `VLLM_RDNA_OFFLOAD_TIMING_SLOW_MS` (default 500), with whether a copy overlapped it. |
@@ -187,7 +215,7 @@ The model's per-layer n-gram embedding table has about 51 billion rows, far too 
 CPU worker process serves lookups from host memory, and the GPUs wait for its results each step.
 
 | Variable | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `VLLM_PLE_CPU_OFFLOAD` | `0` (serve script: `1`) | Serve the n-gram table from the CPU offload worker. |
 | `VLLM_PLE_QUANT_DIR` | unset | Directory of the quantised table sidecar (int4 or fp8). |
 | `VLLM_PLE_DISK_OFFLOAD_DIR` | unset | Directory for the memory-mapped bf16 table (alternative to the sidecar). The first boot streams it out of the checkpoint; later boots map it instantly. |
@@ -205,7 +233,7 @@ CPU worker process serves lookups from host memory, and the GPUs wait for its re
 ## 9. Test-tool variables
 
 | Variable | Used by | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `RDNA_AR_TEST_SO` | `tools/rdna2/ar_ops_test.py` | Path to a freshly built `_rocm_C` library to test without installing it (e.g. `build_rocm/_rocm_C.abi3.so`). |
 | `RDNA_AR_TEST_MAXB` | `tools/rdna2/ar_ops_test.py` | Staging size (bytes) for the all-reduce under test. |
 
@@ -216,7 +244,7 @@ CPU worker process serves lookups from host memory, and the GPUs wait for its re
 Not added by this fork, but part of the working configuration.
 
 | Variable | Value | Why |
-|---|---|---|
+| --- | --- | --- |
 | `HSA_NO_SCRATCH_RECLAIM` | `1` | Keeps the ROCm runtime from reclaiming kernel scratch memory mid-run. Part of the multi-card stability setup. |
 | `NCCL_P2P_LEVEL` | `SYS` (from `P2P`) | RCCL may use direct card-to-card transfers between all cards. |
 | `NCCL_GRAPH_MIXING_SUPPORT` | `1` | Declares that one RCCL communicator is used both in CUDA graphs and eagerly (graph usage mode 2). Without it, RCCL warns on every captured collective that the mix "can lead to hangs". No measurable cost. |

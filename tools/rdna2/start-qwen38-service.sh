@@ -42,10 +42,9 @@ export GPUS="${GPUS:-0,1,2,3}"
 export PORT="${PORT:-8000}"
 
 # --- KV cache dtype ------------------------------------------------------------------------
-# The KV cache stays fp16. The int8 features below quantise WEIGHTS (and prefill activations /
-# all-reduce traffic), never the KV cache. fp8 KV is not an option anyway: the model's sparse
-# attention (vllm/models/qwen4_exp/amd/qsa.py) accepts auto or bfloat16 and rejects explicit
-# float16 and fp8. Use auto with --dtype float16 (the default here).
+# auto keeps the KV cache fp16 with this launcher's --dtype float16. QSA also accepts
+# bfloat16 and int8_per_token_head; int8 KV is opt-in, independent of the int8 features below.
+# Explicit float16 and fp8 KV are still rejected by the QSA implementation.
 export KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
 
 # --- context length / VRAM utilization -----------------------------------------------------
@@ -62,10 +61,10 @@ export MAXLEN="${MAXLEN:-262144}"
 # of single-stream decode speed (~80 -> ~64 t/s); aggregate throughput at 8 concurrent
 # streams reached ~185-200 t/s. MTP=3 restores it.
 export MTP="${MTP:-0}"
-# Concurrent sequences. The fork's decode kernels cover batches <= 8 tokens (rdna_ops.py
-# _DECODE_MAX); above that decode drops to the prefill path. Measured 2026-10-05, 256-token
-# streams: 8 running -> ~185 t/s aggregate, 16 running -> ~130 t/s (9 t/s per stream).
-# Keep at 8 (with MTP>0 each sequence decodes 1+MTP tokens per step: use 2 for MTP=3).
+# Keep the validated eight-sequence deployment default. Since 2026-10-09, skinny decode
+# kernels cover <= 16 tokens; fused glue covers <= 8 and graph-padded 16. MTP increases
+# tokens per step, so validate concurrency changes separately. Before that update, measured
+# 2026-10-05: eight streams ~185 t/s aggregate, sixteen ~130 t/s (256-token completions).
 export MAX_SEQS="${MAX_SEQS:-8}"
 
 # --- int8 performance features (docs/rdna2/CHANGES.md #7, #10, #13, #14, #17) --------------

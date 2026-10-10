@@ -8,8 +8,8 @@
 #     tools/rdna2/serve-qwen38-flash-next.sh
 #
 # Knobs (env): GPUS (ROCR device ids, default 1,2,3,4), PORT (8000), MTP (3), GPUUTIL (0.90),
-#   MAX_SEQS (4; --max-num-seqs. The fork's decode kernels cover batches <= 8 tokens, so keep
-#   MAX_SEQS * (1 + MTP) <= 8), KV_CACHE_DTYPE (auto; 16-bit only, see below),
+#   MAX_SEQS (4; --max-num-seqs. Skinny decode kernels cover batches <= 16 tokens; fused glue
+#   covers <= 8 and graph-padded 16), KV_CACHE_DTYPE (auto; int8_per_token_head opts into int8 KV),
 #   VISION_CPU_OFFLOAD (0; GiB/card for the vision tower in pinned CPU RAM, needs VISION=1),
 #   DENSE_INT8 (1), DENSE_INT8_ONLY (0; 1 = release the fp16 copies of the shadowed projections,
 #   ~3 GiB/card -> KV; own VLLM_CACHE_ROOT + GPUUTIL <= 0.93, see CHANGES.md #7), EAGER (unset),
@@ -52,10 +52,8 @@ PORT="${PORT:-8000}"
 MTP="${MTP:-3}"
 GPUUTIL="${GPUUTIL:-0.90}"
 MAXLEN="${MAXLEN:-131072}"
-# KV cache dtype. The int8 features (DENSE_INT8*, W8A8, W4A8, AR_Q8) quantise weights and
-# prefill activations, never the KV cache. The current sparse-attention implementation
-# (qsa.py) accepts auto or bfloat16, rejecting explicit float16 and fp8. Use auto
-# with --dtype float16 (the default here).
+# QSA accepts auto, bfloat16, or int8_per_token_head; explicit float16 and fp8 are rejected.
+# auto uses the model dtype (float16 here). Weight/activation int8 switches do not change KV.
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
 TRACES="${TRACES:-$PWD/logs/traces}"
 mkdir -p "$TRACES"
@@ -224,6 +222,19 @@ if [[ " ${EXTRA_ARGS:-} " == *" --kv-offloading-size "* ]]; then
   fi
 fi
 
+# Triton pin (2026-10-09): upstream Triton dropped gfx1030 (triton-lang/triton #12042). Refuse to start on a
+# Triton other than the validated build in tools/rdna2/constraints-gfx1030.txt -- a newer one changes every custom
+# kernel's codegen. ALLOW_TRITON_DRIFT=1 overrides (for deliberate Triton experiments).
+_tpin=$(sed -n 's/^triton==//p' "$(dirname "$0")/constraints-gfx1030.txt" 2>/dev/null)
+_tnow=$(python3 -c 'import triton; print(triton.__version__)' 2>/dev/null || true)
+_tdist=$(python3 -c 'import importlib.metadata as m; print(m.version("triton"))' 2>/dev/null || true)
+if [ -n "$_tpin" ] && [ "$_tdist" != "$_tpin" ]; then
+  echo "ERROR: installed Triton is '${_tdist:-none}' (${_tnow:-?}); the validated gfx1030 build is $_tpin." >&2
+  echo "  Upstream Triton no longer supports gfx1030; reinstall the pinned wheel (tools/rdna2/build-torch-rocm714.sh)" >&2
+  echo "  or set ALLOW_TRITON_DRIFT=1 to run anyway." >&2
+  [ "${ALLOW_TRITON_DRIFT:-0}" = "1" ] || exit 1
+fi
+
 # shellcheck disable=SC2206 # EXTRA_ARGS intentionally supplies whitespace-separated arguments.
 CMD=(python3 -m vllm.entrypoints.openai.api_server
   --model "$MODEL" --served-model-name qwen38-flash-next
@@ -246,4 +257,8 @@ if [ "${DRYRUN:-0}" = "1" ]; then
   printf '%q ' "${CMD[@]}"; echo
   exit 0
 fi
-exec "${CMD[@]}"
+# VLLM_SERVE_PREFIX: an optional wrapper for profiling runs, e.g.
+#   VLLM_SERVE_PREFIX="rocprofv3 --kernel-trace -f csv -d /path/out -P 420:4:1 --"
+# (rocprofv3 follows the spawned workers; -P collects one 4 s window 420 s after start). Unset = no wrapper.
+# shellcheck disable=SC2086
+exec ${VLLM_SERVE_PREFIX:-} "${CMD[@]}"

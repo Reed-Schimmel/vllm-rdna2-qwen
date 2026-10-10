@@ -20,6 +20,36 @@ PLE-offload verification at build time). The entrypoint is the serve script; wei
 `/models`. TheRock publishes no gfx103X torch wheels, and the 7.14 line has moved off AMD's current
 channels — the published base image is the durable artifact. See containers/README.md.
 
+**2026-10-09 — MoE decode kernels v2/v3, decode batches up to 16.** The routed-expert decode pair was
+rewritten (v2: 16-byte weight loads, no shared-memory activation staging, EP-local slot compaction) and the
+small-batch kernels (int8/fp16 GEMV, the fused glue ops) now take batches up to 16, so a 9–16-request decode
+step no longer falls off to Triton/rocBLAS. At batch 1–2 the shared expert is folded into the routed pair (v3).
+Per MoE layer at batch 1: 88 → 71 µs (v2) → 65 µs (v3). In the serving process: single-stream decode +3.6 %
+(v2) then +4.1 % (v3); 16 concurrent streams 134 → 266 tok/s aggregate. Greedy output identical to the
+previous kernels. Switches: `VLLM_RDNA_MOE_V2`, `VLLM_RDNA_MOE_V3` (ENVIRONMENT.md).
+
+**2026-10-09 — int8 KV cache for the QSA layers, and the first decode small-op pass.** `--kv-cache-dtype
+int8_per_token_head` now works for Qwen3.8-Flash-Next. The QSA sparse-attention kernel reads int8 K/V and applies the
+per-token scales to the scores and the probabilities; writes go through vLLM's per-token-head quantizing cache kernel.
+This gives 1.95× the KV tokens with no measured speed or retrieval cost (ENVIRONMENT.md). Separately, a kernel trace of a
+whole decode step taken inside the serving process (about 1450 launches) led to two changes: the MoE output is no
+longer copied after every MoE layer, and the hyper-connection down projection uses a split-K GEMV. Together they give
++1.3 % single-stream decode.
+
+**2026-10-09 — follow-up turns resume at the previous prompt's end.** On this hybrid model a follow-up turn
+could only resume at the previous prompt's last full 784-token block, so it recomputed up to 783 tokens of
+history (1567 with int8 KV) before its own message. Upstream's fine-grained prefix hits (`--prefix-match-unit`)
+save a "partial tail" state inside a block, but the scheduler never ended a step there on this model. The fork
+adds that stop and places the tail 4 tokens before the prompt end, past the generation prompt that the next turn
+re-renders. With `--prefix-match-unit 16`, follow-ups recompute ~50–90 tokens. Resumed output matches a full
+recompute to within run-to-run noise.
+
+**2026-10-09 — Triton pinned.** Upstream Triton removed RDNA1/RDNA2 target support (triton-lang/triton #12042,
+2026-09-30): gfx1030 becomes an unknown ISA family. Every custom kernel here (QSA, W4A8 MoE, W8A8, GDN) is Triton,
+so `tools/rdna2/constraints-gfx1030.txt` pins the validated source builds: Triton 3.7.1 (ROCm/triton @ f0b55c0), and
+torch and torchvision with it. Use it as a pip constraint (the host venv's `pip.conf` does). The serve script refuses
+to start on any other Triton unless `ALLOW_TRITON_DRIFT=1`. Container images already build that exact ref.
+
 ## How to see exactly what this fork changed (on GitHub)
 
 The branch has three layers, and GitHub's compare view can show each:
