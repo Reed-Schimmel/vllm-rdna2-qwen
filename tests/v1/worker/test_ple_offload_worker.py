@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import ctypes
+import json
+import sys
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 
 import msgspec
+import numpy as np
 import pytest
 import torch
+from safetensors.torch import save_file
 
 import vllm.envs as envs
 import vllm.v1.worker.gpu_worker as gpu_worker_module
@@ -15,6 +21,14 @@ from vllm.model_executor.layers import ple_offload_layer
 from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.v1.ple_offload import worker as ple_offload_worker
+from vllm.v1.ple_offload.int4_nvme import (
+    INT4_LAYOUT,
+    TABLE_NAME,
+    PleNvmeInt4Table,
+    cache_allocation_bytes,
+    cache_rows_for_budget,
+    prepare_int4_nvme_table,
+)
 from vllm.v1.worker.gpu_worker import Worker
 
 
@@ -641,3 +655,178 @@ def test_wait_for_ready_closes_pipe() -> None:
     ple_offload_worker.PleOffloadWorker.wait_for_ready(handle)
 
     assert handle.ready_pipe_reader is None
+
+
+def _tiny_int4_sidecar(tmp_path: Path):
+    quant_dir = tmp_path / "sidecar"
+    quant_dir.mkdir()
+    (quant_dir / "META.json").write_text(
+        json.dumps({"layout": INT4_LAYOUT, "rows": 8, "width": 32, "shards": 2})
+    )
+    packed, scales = [], []
+    for shard in range(2):
+        q = (torch.arange(64).reshape(4, 16) + shard * 64).to(torch.uint8)
+        s = (torch.arange(8).reshape(4, 2) + 1 + shard).to(torch.float16) / 8
+        save_file(
+            {"weight_i4": q, "weight_scale": s},
+            quant_dir / f"shard_{shard}.safetensors",
+        )
+        packed.append(q)
+        scales.append(s)
+    reference = ple_offload_worker._PleQuantTable.__new__(
+        ple_offload_worker._PleQuantTable
+    )
+    reference.layout, reference.width = INT4_LAYOUT, 32
+    reference._q, reference._s = packed, scales
+    expected = torch.cat(
+        [reference._dequant(shard, torch.arange(4)) for shard in range(2)]
+    )
+    fused = torch.cat(
+        [torch.cat((q, s.view(torch.uint8)), dim=1) for q, s in zip(packed, scales)]
+    ).numpy()
+    return quant_dir, fused, expected
+
+
+class _TinyRawNvmeTable:
+    """Exercise the adapter's byte-row ABI without native I/O or large caches."""
+
+    def __init__(self, path, rows, row_bytes, cache_rows, queue_depth):
+        del cache_rows, queue_depth
+        self.rows = np.frombuffer(Path(path).read_bytes(), dtype=np.uint8)
+        self.rows = self.rows[: rows * row_bytes].reshape(rows, row_bytes)
+        self.requests = []
+
+    def gather(self, ids_ptr, count, out_ptr, stride):
+        ids = np.ctypeslib.as_array((ctypes.c_int64 * count).from_address(ids_ptr))
+        out = np.ctypeslib.as_array(
+            (ctypes.c_uint8 * (count * stride)).from_address(out_ptr)
+        ).reshape(count, stride)
+        self.requests.append(ids.tolist())
+        out[:] = self.rows[ids]
+
+    def stats(self):
+        return {"align": 512, "backend": "test", "unlocked_bytes": 0}
+
+
+def _mock_nvme_extension(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(
+        sys.modules, "ple_nvme_ext", SimpleNamespace(NvmeTable=_TinyRawNvmeTable)
+    )
+
+
+def test_int4_nvme_preparation_preserves_codes_and_scale_bytes(tmp_path: Path):
+    quant_dir, fused, _ = _tiny_int4_sidecar(tmp_path)
+    directory = tmp_path / "nvme"
+    path = prepare_int4_nvme_table(quant_dir, directory, chunk_rows=2)
+
+    raw = path.read_bytes()
+    assert raw[: fused.nbytes] == fused.tobytes()
+    assert raw[fused.nbytes :] == bytes(4096 - fused.nbytes)
+    identity = path.stat()
+    assert prepare_int4_nvme_table(quant_dir, directory) == path
+    assert path.stat().st_mtime_ns == identity.st_mtime_ns
+
+
+def test_int4_nvme_gathers_match_existing_decoder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    quant_dir, _, expected = _tiny_int4_sidecar(tmp_path)
+    directory = tmp_path / "nvme"
+    prepare_int4_nvme_table(quant_dir, directory)
+    _mock_nvme_extension(monkeypatch)
+    table = PleNvmeInt4Table(str(quant_dir), str(directory), 8, 32)
+    try:
+        ids = np.array([7, 0, 7, 3], dtype=np.int64)
+        out = np.empty((4, 32), dtype=np.float32)
+        table.gather_rows_small(ids, out)
+        np.testing.assert_array_equal(out, expected[ids].numpy())
+
+        for dtype in (torch.float16, torch.bfloat16):
+            tensor_out = torch.empty((4, 32), dtype=dtype)
+            table.gather_into(torch.from_numpy(ids), tensor_out)
+            assert torch.equal(tensor_out, expected[ids].to(dtype))
+    finally:
+        table.close()
+
+
+@pytest.mark.parametrize("row_bytes", [100, 130])
+def test_int4_nvme_budget_includes_index_and_staging(row_bytes: int):
+    budget = 8 << 30
+    rows = cache_rows_for_budget(budget, row_bytes, 512, 320001536)
+    assert cache_allocation_bytes(rows, row_bytes, 512) <= budget
+    assert cache_allocation_bytes(rows + 1, row_bytes, 512) > budget
+    assert rows * row_bytes < budget
+
+
+def test_int4_nvme_rejects_changed_source_without_rebuilding(tmp_path: Path):
+    quant_dir, _, _ = _tiny_int4_sidecar(tmp_path)
+    directory = tmp_path / "nvme"
+    table = prepare_int4_nvme_table(quant_dir, directory)
+    original = table.read_bytes()
+    with (quant_dir / "shard_0.safetensors").open("ab") as shard:
+        shard.write(b"changed")
+
+    with pytest.raises(ValueError, match="source changed"):
+        prepare_int4_nvme_table(quant_dir, directory)
+    assert table.read_bytes() == original
+
+
+def test_int4_nvme_rejects_truncated_table_before_native_gather(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    quant_dir, _, _ = _tiny_int4_sidecar(tmp_path)
+    directory = tmp_path / "nvme"
+    path = prepare_int4_nvme_table(quant_dir, directory)
+    path.write_bytes(b"truncated")
+    _mock_nvme_extension(monkeypatch)
+
+    with pytest.raises(ValueError, match="incorrect size"):
+        PleNvmeInt4Table(str(quant_dir), str(directory), 8, 32)
+
+
+def test_int4_nvme_directory_has_one_runtime_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    quant_dir, _, _ = _tiny_int4_sidecar(tmp_path)
+    directory = tmp_path / "nvme"
+    prepare_int4_nvme_table(quant_dir, directory)
+    _mock_nvme_extension(monkeypatch)
+    table = PleNvmeInt4Table(str(quant_dir), str(directory), 8, 32)
+    try:
+        with pytest.raises(RuntimeError, match="Another process owns"):
+            PleNvmeInt4Table(str(quant_dir), str(directory), 8, 32)
+    finally:
+        table.close()
+    reopened = PleNvmeInt4Table(str(quant_dir), str(directory), 8, 32)
+    reopened.close()
+
+
+def test_nvme_sidecar_is_not_whole_table_prefaulted(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("PLE_OFFLOAD_PREFAULT", "1")
+    table = SimpleNamespace(
+        is_nvme=True,
+        populate_page_tables=lambda: pytest.fail("NVMe table must not be prefaulted"),
+    )
+    layer = SimpleNamespace(ngram_embedding=SimpleNamespace(_ple_quant=table))
+    ple_offload_worker._prefault_sidecar_async({"ple": layer})
+
+
+def test_native_nvme_cache_deduplicates_misses_and_survives_eviction(tmp_path: Path):
+    """Native correctness only: eight rows, two cache slots, no timing claims."""
+    native = pytest.importorskip("ple_nvme_ext")
+    _, fused, _ = _tiny_int4_sidecar(tmp_path)
+    path = tmp_path / TABLE_NAME
+    path.write_bytes(fused.tobytes() + bytes(4096 - fused.nbytes))
+    table = native.NvmeTable(str(path), 8, 20, 2, 2)
+
+    def gather(values):
+        ids = np.array(values, dtype=np.int64)
+        out = np.empty((ids.size, 20), dtype=np.uint8)
+        stats = table.gather(ids.ctypes.data, ids.size, out.ctypes.data, 20)
+        np.testing.assert_array_equal(out, fused[ids])
+        return stats
+
+    assert gather([1, 1, 2])["reads"] == 2
+    assert gather([1, 2])["hits"] == 2
+    gather([3, 4])
+    assert gather([1])["reads"] == 1

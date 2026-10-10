@@ -44,6 +44,23 @@ set -euo pipefail
 # unquantised bf16 table from checkpoint shard 1 via the disk path (PLE_DISK_DIR=<writable dir for the 95 GiB
 # raw table file>; MODEL must then be a directory whose index lists shard 1). First bf16 boot copies the table
 # out of shard 1 into PLE_DISK_DIR; later boots map that file.
+# Optional INT4 NVMe cache: PLE_NVME_DIR=<prepared table directory>,
+# PLE_NVME_CACHE_GB=8 (arena + index + staging budget), PLE_NVME_QUEUE_DEPTH=512.
+# Preparation is explicit; see docs/rdna2/PLE-NVME.md.
+if [ -n "${PLE_NVME_DIR:-}" ] && [ -n "${PLE_DISK_DIR:-}" ]; then
+  echo "PLE_NVME_DIR requires the INT4 sidecar, not PLE_DISK_DIR" >&2
+  exit 1
+fi
+if [ -n "${PLE_NVME_DIR:-}" ]; then
+  if [ "${PLE_OFFLOAD_ANON:-0}" = 1 ]; then
+    echo "PLE_NVME_DIR cannot use PLE_OFFLOAD_ANON=1" >&2
+    exit 1
+  fi
+  if [ ! -f "$PLE_NVME_DIR/ple_int4.json" ]; then
+    echo "Prepare PLE_NVME_DIR explicitly before serving; see docs/rdna2/PLE-NVME.md" >&2
+    exit 1
+  fi
+fi
 if [ -z "${PLE_DISK_DIR:-}" ]; then
   : "${PLE_INT4:?set PLE_INT4 to the ples_int4 sidecar directory (128 shards + META.json)}"
 fi
@@ -127,6 +144,9 @@ if [ -n "${PLE_DISK_DIR:-}" ]; then
 else
   export VLLM_PLE_QUANT_DIR="$PLE_INT4"
 fi
+export VLLM_PLE_NVME_DIR="${PLE_NVME_DIR:-}"
+export VLLM_PLE_NVME_CACHE_GB="${PLE_NVME_CACHE_GB:-8}"
+export VLLM_PLE_NVME_QUEUE_DEPTH="${PLE_NVME_QUEUE_DEPTH:-512}"
 export VLLM_PLE_OFFLOAD_READY_TIMEOUT=3600
 # int8 shadows of the dense fp16 projections for decode (CHANGES.md #7)
 export VLLM_RDNA_DENSE_INT8="${DENSE_INT8:-1}"

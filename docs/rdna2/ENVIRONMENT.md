@@ -25,6 +25,9 @@ either keep `COMPILE_CACHE_OFF=1` (the serve script's default) or clear the comp
 |---|---|---|
 | `MODEL` | required | Directory of the AWQ-W4A16 backbone (checkpoint shards 2–5 plus `model_mtp.safetensors`). |
 | `PLE_INT4` | required unless `PLE_DISK_DIR` | Directory of the quantised n-gram table sidecar (int4 or fp8, 128 shards + `META.json`). Exported as `VLLM_PLE_QUANT_DIR`. |
+| `PLE_NVME_DIR` | unset | Experimental INT4 SSD cache using an explicitly prepared flat table. See [PLE-NVME.md](PLE-NVME.md); not yet performance-validated. |
+| `PLE_NVME_CACHE_GB` | `8` | GiB budget for cached row payload, row index and I/O staging; excludes other worker memory. |
+| `PLE_NVME_QUEUE_DEPTH` | `512` | NVMe cache miss queue depth (1–4096). |
 | `PLE_DISK_DIR` | unset | Alternative to `PLE_INT4`: a writable directory for the unquantised bf16 n-gram table (~95 GiB). The first boot copies the table out of checkpoint shard 1; later boots memory-map the file. Exported as `VLLM_PLE_DISK_OFFLOAD_DIR`. |
 | `GPUS` | `1,2,3,4` | ROCr device IDs to serve on (`ROCR_VISIBLE_DEVICES`). Excludes device 0, typically a display card. |
 | `PORT` | `8000` | HTTP port of the OpenAI-compatible API. |

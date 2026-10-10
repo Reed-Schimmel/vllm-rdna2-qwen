@@ -793,6 +793,8 @@ def _prefault_sidecar_async(layers) -> None:
             break
     if quant is None:
         return
+    if getattr(quant, "is_nvme", False):
+        return
 
     def run():
         t0 = time.perf_counter()
@@ -845,7 +847,22 @@ def _ple_quant_attach(layer_name: str, layer: torch.nn.Module,
     parts = pname.split(".")
     for p in parts[:-1]:
         owner = getattr(owner, p)
-    owner._ple_quant = _PleQuantTable(quant_dir, rows, width)
+    nvme_dir = os.environ.get("VLLM_PLE_NVME_DIR")
+    if nvme_dir:
+        if os.environ.get("PLE_OFFLOAD_ANON", "0") == "1":
+            raise ValueError("INT4 NVMe caching cannot use PLE_OFFLOAD_ANON=1")
+        from vllm.v1.ple_offload.int4_nvme import PleNvmeInt4Table
+
+        owner._ple_quant = PleNvmeInt4Table(
+            quant_dir,
+            nvme_dir,
+            rows,
+            width,
+            cache_gb=float(os.environ.get("VLLM_PLE_NVME_CACHE_GB", "8")),
+            queue_depth=int(os.environ.get("VLLM_PLE_NVME_QUEUE_DEPTH", "512")),
+        )
+    else:
+        owner._ple_quant = _PleQuantTable(quant_dir, rows, width)
     # Stub before anything writes the parameter: the original 95 GB allocation
     # is lazy virtual memory and stays unmaterialized.
     stub = torch.empty(0, width, dtype=param.dtype)
@@ -1015,6 +1032,13 @@ class PleOffloadRunner:
         offload_prefixes = tuple(f"{name}." for name in offload_layers)
 
         quant_dir = _ple_quant_dir()
+        if os.environ.get("VLLM_PLE_NVME_DIR") and (
+            quant_dir is None or _ple_disk_dir() is not None
+        ):
+            raise ValueError(
+                "INT4 NVMe caching requires VLLM_PLE_QUANT_DIR and cannot "
+                "use VLLM_PLE_DISK_OFFLOAD_DIR"
+            )
         # A quantized sidecar replaces the checkpoint table outright, so the
         # bf16 disk-paging path is not used when one is configured.
         disk_dir = _ple_disk_dir() if quant_dir is None else None
@@ -1519,3 +1543,15 @@ class PleOffloadRunner:
                 (self._t_total - self._t_lookup) / n * 1e3, self._t_total / n * 1e3,
                 f"; fused-check mismatches {_FUSED_MISMATCH[0]}" if self._fused_check else "",
             )
+            for layer_name, layer in self._layers.items():
+                embedding = getattr(layer, "ngram_embedding", None)
+                quant = getattr(embedding, "_ple_quant", None)
+                if getattr(quant, "is_nvme", False):
+                    stats = quant.stats()
+                    logger.info(
+                        "PLE NVMe cache %s: hits %d, misses %d, distinct reads %d",
+                        layer_name,
+                        stats["hits"],
+                        stats["misses"],
+                        stats["reads"],
+                    )
