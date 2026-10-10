@@ -13,12 +13,14 @@ import torch
 
 from tests.v1.core.test_prefix_caching import make_kv_cache_manager, make_request
 from vllm.utils.hashing import sha256
+from vllm.v1.core import single_type_kv_cache_manager
 from vllm.v1.core.kv_cache_utils import (
     KVCacheBlockCopy,
     get_block_hash,
     get_group_id,
     init_none_hash,
 )
+from vllm.v1.core.sched import scheduler as scheduler_module
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -32,6 +34,56 @@ from vllm.v1.kv_cache_interface import (
 @pytest.fixture(autouse=True)
 def _auto_init_hash_fn():
     init_none_hash(sha256)
+
+
+@pytest.fixture(autouse=True)
+def _stock_tail_boundaries(monkeypatch):
+    """Synthetic prompts below test generic caching, not Qwen's generation suffix."""
+    monkeypatch.setattr(single_type_kv_cache_manager, "_PROMPT_TAIL_BACKOFF", 0)
+    monkeypatch.setattr(scheduler_module, "_RETENTION_STOPS", False)
+    monkeypatch.setattr(scheduler_module, "_TAIL_STOP", False)
+
+
+@pytest.mark.parametrize(
+    "prompt_tokens,backoff,expected",
+    [(3, 4, 0), (16, 4, 0), (32, 4, 16), (36, 4, 32), (32, 0, 32)],
+)
+def test_prompt_tail_boundary_excludes_generation_suffix(
+    monkeypatch, prompt_tokens, backoff, expected
+):
+    monkeypatch.setattr(single_type_kv_cache_manager, "_PROMPT_TAIL_BACKOFF", backoff)
+    assert (
+        single_type_kv_cache_manager.prompt_tail_boundary(prompt_tokens, 16) == expected
+    )
+
+
+@pytest.mark.parametrize("tail_stop", [True, False])
+@pytest.mark.parametrize("prompt_tokens,boundary", [(1008, 992), (1012, 1008)])
+def test_rdna_tail_stop_saves_state_before_generation_suffix(
+    monkeypatch, tail_stop, prompt_tokens, boundary
+):
+    """The fine hash stop must fire even with four-token scheduler blocks."""
+    monkeypatch.setattr(single_type_kv_cache_manager, "_PROMPT_TAIL_BACKOFF", 4)
+    monkeypatch.setattr(scheduler_module, "_RETENTION_STOPS", True)
+    monkeypatch.setattr(scheduler_module, "_TAIL_STOP", tail_stop)
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=4),
+        use_eagle=False,
+        hash_block_size=16,
+        mamba_partial_cache_hit=True,
+        mamba_has_prefill_checkpoint_blocks=False,
+        need_mamba_block_aligned_split=True,
+        _mamba_state_block_size=784,
+        kv_cache_manager=SimpleNamespace(
+            coordinator=SimpleNamespace(enable_partial_hash_hits=True)
+        ),
+    )
+    request = make_request("0", [0] * prompt_tokens, 16, sha256)
+    request.num_computed_tokens = 784
+    scheduled = Scheduler._mamba_block_aligned_split(
+        scheduler, request, prompt_tokens - 784
+    )
+    assert scheduled == (boundary if tail_stop else prompt_tokens) - 784
 
 
 def test_connector_without_divergent_hit_support_uses_common_lookup():
